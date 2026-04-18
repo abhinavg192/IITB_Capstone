@@ -5,6 +5,8 @@ An AI-powered social media content generation system that generates
 platform-specific posts with brand voice alignment, trending topic 
 injection, and ML-based engagement scoring.
 
+Project plan can be access via this link: [https://www.notion.so/Project-Plan-3456ba0edea68081a62dc6575df3ae55?source=copy_link
+](https://noisy-broccoli-ff7.notion.site/Project-Plan-3456ba0edea68081a62dc6575df3ae55)
 ## Team
 | Member | Module |
 |---|---|
