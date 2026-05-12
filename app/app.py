@@ -9,6 +9,17 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import random
+import re
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from modules.predictor import predict_engagement
+
+# Initialize NLTK VADER
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon')
+analyzer = SentimentIntensityAnalyzer()
 
 # Page configuration
 st.set_page_config(
@@ -82,12 +93,26 @@ def generate_posts(brand, topic, platform, tone):
     In production, this would call GPT-4/Claude API
     """
     
+    def parse_hour(time_str):
+        import re
+        match = re.search(r'(\d+):00\s*(AM|PM)', time_str)
+        if match:
+            hour = int(match.group(1))
+            if match.group(2) == 'PM' and hour != 12:
+                hour += 12
+            elif match.group(2) == 'AM' and hour == 12:
+                hour = 0
+            return hour
+        return 12  # default
+    
+    cta_keywords = ['link', 'register', 'learn more', 'sign up', 'click here', 'visit', 'download', 'bio', 'get started']
+    platform_encoded = 0 if platform == 'twitter' else 1
+    
     # Different variants with predicted scores
     variants = {
         'twitter': [
             {
                 'content': f"Exciting news about {topic}! 🚀 {brand} is leading the way in innovation. What are your thoughts? #Innovation #{brand}",
-                'score': 92,
                 'hashtags': '#Innovation #' + brand,
                 'char_count': 127,
                 'best_time': '2:00 PM - 4:00 PM EST',
@@ -95,7 +120,6 @@ def generate_posts(brand, topic, platform, tone):
             },
             {
                 'content': f"Big things happening at {brand}! Our latest work on {topic} is changing the game. Join the conversation 💪 #{brand}Community",
-                'score': 88,
                 'hashtags': '#' + brand + 'Community',
                 'char_count': 134,
                 'best_time': '11:00 AM - 1:00 PM EST',
@@ -103,7 +127,6 @@ def generate_posts(brand, topic, platform, tone):
             },
             {
                 'content': f"Did you know? {brand}'s approach to {topic} is revolutionizing the industry. Learn more → [link] #TechNews #{brand}",
-                'score': 85,
                 'hashtags': '#TechNews #' + brand,
                 'char_count': 125,
                 'best_time': '9:00 AM - 11:00 AM EST',
@@ -111,7 +134,6 @@ def generate_posts(brand, topic, platform, tone):
             },
             {
                 'content': f"🎯 {brand} + {topic} = Innovation at its finest. Here's what makes our approach different: [thread]",
-                'score': 81,
                 'hashtags': '',
                 'char_count': 98,
                 'best_time': '3:00 PM - 5:00 PM EST',
@@ -119,7 +141,6 @@ def generate_posts(brand, topic, platform, tone):
             },
             {
                 'content': f"Transforming {topic} one step at a time. {brand} is committed to excellence. #Innovation #Excellence #{brand}",
-                'score': 78,
                 'hashtags': '#Innovation #Excellence #' + brand,
                 'char_count': 115,
                 'best_time': '5:00 PM - 7:00 PM EST',
@@ -133,14 +154,13 @@ def generate_posts(brand, topic, platform, tone):
 At {brand}, we believe that innovation comes from understanding both the technical challenges and human needs. Our recent work demonstrates how a data-driven approach can transform outcomes.
 
 Key takeaways:
-• Strategic implementation matters more than technology alone
-• Cross-functional collaboration drives success
-• Continuous learning is essential
+- Strategic implementation matters more than technology alone
+- Cross-functional collaboration drives success
+- Continuous learning is essential
 
 What's your experience with {topic}? I'd love to hear your thoughts.
 
 #Innovation #Leadership #{brand}""",
-                'score': 94,
                 'hashtags': '#Innovation #Leadership #' + brand,
                 'char_count': 456,
                 'best_time': '8:00 AM - 10:00 AM EST',
@@ -158,7 +178,6 @@ Our team has spent the last quarter developing solutions that address real-world
 Proud of what we've built together. Here's to continued innovation!
 
 #{brand} #Innovation #BusinessGrowth""",
-                'score': 90,
                 'hashtags': '#' + brand + ' #Innovation #BusinessGrowth',
                 'char_count': 423,
                 'best_time': '12:00 PM - 2:00 PM EST',
@@ -177,7 +196,6 @@ The landscape is evolving rapidly, and those who adapt will thrive.
 What trends are you seeing in your field?
 
 #ThoughtLeadership #{brand}""",
-                'score': 86,
                 'hashtags': '#ThoughtLeadership #' + brand,
                 'char_count': 356,
                 'best_time': '10:00 AM - 12:00 PM EST',
@@ -191,25 +209,13 @@ Our methodology combines proven practices with innovative thinking. The results?
 Interested in learning more? Let's connect.
 
 #Innovation #{brand}""",
-                'score': 82,
                 'hashtags': '#Innovation #' + brand,
                 'char_count': 298,
                 'best_time': '2:00 PM - 4:00 PM EST',
                 'predicted_engagement': {'likes': 420, 'comments': 28, 'shares': 65}
-            },
-            {
-                'content': f"""Quick update on our {topic} initiative at {brand}:
-
-We're seeing tremendous progress and the team's dedication is inspiring. More details coming soon!
-
-#{brand} #TeamWork #Progress""",
-                'score': 75,
-                'hashtags': '#' + brand + ' #TeamWork #Progress',
-                'char_count': 198,
-                'best_time': '4:00 PM - 6:00 PM EST',
-                'predicted_engagement': {'likes': 340, 'comments': 22, 'shares': 48}
             }
         ],
+
         'instagram': [
             {
                 'content': f"""✨ Big news from {brand}! ✨
@@ -220,11 +226,9 @@ From concept to reality, every step has been an incredible journey. Thank you to
 
 What would you like to see next? Drop your ideas in the comments! 👇
 
-.
-.
-.
+etc.
+
 #Innovation #BehindTheScenes #{brand} #CreativeProcess #TeamWork #Vision #Progress #Community""",
-                'score': 91,
                 'hashtags': '#Innovation #BehindTheScenes #' + brand + ' #CreativeProcess #TeamWork #Vision #Progress #Community',
                 'char_count': 512,
                 'best_time': '11:00 AM - 1:00 PM EST',
@@ -238,7 +242,6 @@ What would you like to see next? Drop your ideas in the comments! 👇
 Tag someone who needs to see this! 
 
 #{brand} #Innovation #Future #Inspiration #Goals""",
-                'score': 87,
                 'hashtags': '#' + brand + ' #Innovation #Future #Inspiration #Goals',
                 'char_count': 268,
                 'best_time': '7:00 PM - 9:00 PM EST',
@@ -252,7 +255,6 @@ Our team at {brand} has been working hard on {topic}, and we can't wait to share
 Stay tuned for updates. 
 
 #{brand}Community #Innovation #ComingSoon #Excited""",
-                'score': 83,
                 'hashtags': '#' + brand + 'Community #Innovation #ComingSoon #Excited',
                 'char_count': 289,
                 'best_time': '5:00 PM - 7:00 PM EST',
@@ -264,7 +266,6 @@ Stay tuned for updates.
 {brand} is committed to excellence and innovation. Here's a glimpse of what we've been up to!
 
 #{brand} #Excellence #Innovation""",
-                'score': 79,
                 'hashtags': '#' + brand + ' #Excellence #Innovation',
                 'char_count': 198,
                 'best_time': '3:00 PM - 5:00 PM EST',
@@ -276,7 +277,6 @@ Stay tuned for updates.
 {brand} continues to push boundaries in {topic}. More updates coming!
 
 #{brand} #Progress""",
-                'score': 74,
                 'hashtags': '#' + brand + ' #Progress',
                 'char_count': 156,
                 'best_time': '1:00 PM - 3:00 PM EST',
@@ -285,7 +285,68 @@ Stay tuned for updates.
         ]
     }
     
+    # Predict engagement for each variant
+    raw_scores = []
+    for variant in variants[platform.lower()]:
+        content = variant['content']
+        caption_length = len(content)
+        hashtag_count = len(re.findall(r'#\w+', content))
+        sentiment_score = analyzer.polarity_scores(content)['compound']
+        has_cta = 1 if any(keyword in content.lower() for keyword in cta_keywords) else 0
+        hour_posted = parse_hour(variant['best_time'])
+        
+        features_dict = {
+            'caption_length': caption_length,
+            'hashtag_count': hashtag_count,
+            'new_sentiment_score': sentiment_score,
+            'has_cta': has_cta,
+            'platform_encoded': platform_encoded,
+            'hour_posted': hour_posted
+        }
+        
+        predicted = predict_engagement(features_dict)
+        variant['raw_score'] = predicted
+        variant['predicted_engagement'] = derive_engagement_metrics(predicted, platform.lower())
+        raw_scores.append(predicted)
+
+    normalized_scores = normalize_scores(raw_scores)
+    for variant, normalized in zip(variants[platform.lower()], normalized_scores):
+        variant['score'] = normalized
+    
     return variants.get(platform.lower(), variants['twitter'])
+
+def normalize_scores(raw_scores):
+    """Normalize raw model predictions to a 0-100 variant score range."""
+    if not raw_scores:
+        return []
+    min_raw = min(raw_scores)
+    max_raw = max(raw_scores)
+    if max_raw <= min_raw:
+        return [100.0] * len(raw_scores)
+    return [round((score - min_raw) / (max_raw - min_raw) * 100, 2) for score in raw_scores]
+
+
+def derive_engagement_metrics(raw_score, platform):
+    """Generate a simple engagement breakdown from the model's raw prediction."""
+    if platform == 'twitter':
+        return {
+            'likes': int(round(raw_score * 100 + 80)),
+            'retweets': int(round(raw_score * 24 + 14)),
+            'replies': int(round(raw_score * 8 + 6))
+        }
+    elif platform == 'linkedin':
+        return {
+            'likes': int(round(raw_score * 120 + 90)),
+            'comments': int(round(raw_score * 16 + 12)),
+            'shares': int(round(raw_score * 10 + 8))
+        }
+    else:
+        return {
+            'likes': int(round(raw_score * 140 + 100)),
+            'comments': int(round(raw_score * 14 + 10)),
+            'shares': int(round(raw_score * 12 + 9))
+        }
+
 
 def get_score_class(score):
     """Return CSS class based on score"""

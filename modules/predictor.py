@@ -88,7 +88,7 @@ def load_model():
     with open(COLUMNS_PATH, 'rb') as f:
         _train_columns = pickle.load(f)
 
-    print(f"✅ XGBoost model loaded ({len(_train_columns)} features)")
+    print(f"XGBoost model loaded ({len(_train_columns)} features)")
     return _model, _train_columns
 
 
