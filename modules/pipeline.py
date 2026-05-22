@@ -71,6 +71,19 @@ def _init_llm(model: str = "claude-haiku-4-5-20251001") -> ChatAnthropic:
 _llm = _init_llm()
 
 # ─────────────────────────────────────────────────────────────
+# LAST CONTEXT — exposed so judge.py can retrieve brand context
+# used in the most recent generate_posts() call
+# ─────────────────────────────────────────────────────────────
+
+_last_context: str = ""
+
+
+def get_last_context() -> str:
+    """Returns the brand context used in the last generate_posts() call."""
+    return _last_context
+
+
+# ─────────────────────────────────────────────────────────────
 # RAG MODULE IMPORT
 # ─────────────────────────────────────────────────────────────
 
@@ -527,7 +540,7 @@ def generate_posts(
             - suggested_posting_time
             - platform
     """
-    global _llm
+    global _llm, _last_context
 
     # Swap model if requested
     if model:
@@ -558,6 +571,8 @@ def generate_posts(
             f"Write in a {tone} tone appropriate "
             f"for {brand_name} on {platform}."
         )
+
+    _last_context = context
 
     # ── Step 2: Assemble prompt ──
     filled_prompt = UNIFIED_TEMPLATE.format(
@@ -603,6 +618,7 @@ def optimize_variants(variants: list, platform: str) -> tuple:
 
         for i, variant in enumerate(variants):
             features = extract_features(variant, platform)
+            variant['features'] = features
             # Fix hour to neutral — posting time is a recommendation,
             # not a content quality signal
             #features['hour_posted'] = 9

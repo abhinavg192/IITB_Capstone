@@ -1,3 +1,5 @@
+# macOS: run `brew install libomp` before installing xgboost
+xgboost
 faiss-cpu
 langchain-anthropic
 langchain-core
