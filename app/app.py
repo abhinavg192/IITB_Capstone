@@ -11,7 +11,10 @@ os.environ["OMP_NUM_THREADS"] = "1"
 # Add repo root to path so modules/ is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import json
+import math
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -21,8 +24,9 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from modules.predictor import predict_engagement
-from modules.pipeline import generate_posts, optimize_variants
+from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features
 from modules.rag import build_index, retrieve_brand_context, is_index_built
+from modules.judge import judge_variants, judge
 
 # Initialize NLTK VADER
 try:
@@ -96,6 +100,19 @@ if 'generated_posts' not in st.session_state:
 if 'selected_post' not in st.session_state:
     st.session_state.selected_post = None
 
+_LOG_MAX = math.log1p(4.0)  # log-scale ceiling anchored to raw score ~4
+
+
+def _add_display_scores(variants):
+    """Map raw XGBoost scores to a 0-100 index via log-scale absolute normalization.
+    Anchored to a realistic ceiling (~4.0 raw) so scores reflect genuine quality,
+    not just relative rank within the batch."""
+    for v in variants:
+        r = v.get('predicted_score') or 0
+        v['display_score'] = min(100, max(0, round(math.log1p(r) / _LOG_MAX * 100)))
+    return variants
+
+
 def run_pipeline(brand, topic, platform, tone, pdf_path=None):
     """
     Calls real Claude pipeline to generate 5 post variants.
@@ -121,9 +138,20 @@ def run_pipeline(brand, topic, platform, tone, pdf_path=None):
         platform.lower()
     )
 
-    # Add scoring_failed flag to each variant
+    # Add scoring_failed flag and normalized display score to each variant
+    _add_display_scores(ranked)
     for v in ranked:
         v['scoring_failed'] = scoring_failed
+
+    # Judge variants for faithfulness + relevance
+    brand_context = get_last_context()
+    judge_question = (
+        f"{platform} post for {brand} about {topic} in a {tone} tone"
+    )
+    try:
+        judge_variants(ranked, brand_context, judge_question)
+    except Exception as e:
+        print(f"⚠️ Judge step skipped: {e}")
 
     return ranked
 
@@ -319,27 +347,29 @@ def screen_output():
     
     # Display variants
     for idx, variant in enumerate(posts_data['variants'], 1):
-        score = variant.get('predicted_score', 0) or 0
-        all_scores = [v.get('predicted_score', 0) or 0 for v in posts_data['variants']]
-        score_class = get_score_class(score, all_scores)
-        
+        display_score = variant.get('display_score', 0) or 0
+        all_display_scores = [v.get('display_score', 0) or 0 for v in posts_data['variants']]
+        score_class = get_score_class(display_score, all_display_scores)
+
         with st.container():
             # Header row with variant number and score
             col_h1, col_h2 = st.columns([3, 1])
-            
+
             with col_h1:
                 st.markdown(f"#### Variant {idx}")
             with col_h2:
                 recommended = "⭐ " if variant.get('is_recommended') else ""
-                st.markdown(f'<span class="score-badge {score_class}">{recommended}Score: {score:,.0f}</span>', unsafe_allow_html=True)
+                st.markdown(f'<span class="score-badge {score_class}">{recommended}Score: {display_score}/100</span>', unsafe_allow_html=True)
             
-            # Content
+            # Content — key includes content hash so regenerated text always renders fresh
+            post_text = variant.get('post_text', '')
+            content_key = f"content_{idx}_{abs(hash(post_text[:80])) % 100000}"
             st.markdown("**Content:**")
             st.text_area(
                 "Content",
-                value=variant.get('post_text', ''),
+                value=post_text,
                 height=150,
-                key=f"content_{idx}",
+                key=content_key,
                 label_visibility="collapsed"
             )
             
@@ -352,22 +382,118 @@ def screen_output():
             with col_m3:
                 hashtags = ' '.join(variant.get('hashtags', []))
                 st.caption(f"🏷️ {hashtags if hashtags else 'No hashtags'}")
+
+            # Judge scores
+            j_faith = variant.get('judge_faithfulness')
+            j_rel   = variant.get('judge_relevance')
+            if j_faith is not None or j_rel is not None:
+                col_j1, col_j2, col_j3 = st.columns(3)
+                with col_j1:
+                    st.caption(f"🎯 Brand Faithfulness: **{j_faith}/10**" if j_faith else "🎯 Faithfulness: N/A")
+                with col_j2:
+                    st.caption(f"📌 Topic Relevance: **{j_rel}/10**" if j_rel else "📌 Relevance: N/A")
+                with col_j3:
+                    explanation = variant.get('judge_explanation', '')
+                    if explanation and explanation != "judge unavailable":
+                        st.caption(f"💬 _{explanation}_")
             
-            # Action buttons
-            col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+            # Action buttons — Edit | Regenerate | Analytics on one row, Copy below
+            col_b1, col_b2, col_b3 = st.columns(3)
             with col_b1:
-                if st.button("📋 Copy", key=f"copy_{idx}", use_container_width=True):
-                    st.success("✅ Copied to clipboard!")
-            with col_b2:
                 if st.button("✏️ Edit", key=f"edit_{idx}", use_container_width=True):
                     st.info("Edit mode enabled")
             with col_b3:
+                if st.button("📊 Analytics", key=f"analytics_{idx}", use_container_width=True):
+                    st.session_state.selected_post = variant
+                    st.session_state.screen = 'metrics'
+                    st.rerun()
+            with col_b2:
                 if st.button("🔄 Regenerate", key=f"regen_{idx}", use_container_width=True):
-                    st.info("Regenerating variant...")
-            with col_b4:
-                if st.button("✅ Select & Schedule", key=f"select_{idx}", type="primary", use_container_width=True):
-                    st.success(f"✅ Variant {idx} selected for scheduling!")
-            
+                    with st.spinner(f"Regenerating variant {idx}..."):
+                        try:
+                            new_variants = generate_posts(
+                                brand_name=posts_data['brand'],
+                                topic=posts_data['topic'],
+                                tone=posts_data['tone'],
+                                platform=posts_data['platform'].lower(),
+                            )
+                            if new_variants:
+                                pick = min(idx - 1, len(new_variants) - 1)
+                                new_v = new_variants[pick]
+                                feats = extract_features(new_v, posts_data['platform'].lower())
+                                new_v['features'] = feats
+                                new_v['predicted_score'] = predict_engagement(feats)
+                                new_v['is_recommended'] = False
+                                new_v['scoring_failed'] = False
+                                brand_ctx = get_last_context()
+                                judge_q = (
+                                    f"{posts_data['platform']} post for {posts_data['brand']} "
+                                    f"about {posts_data['topic']} in a {posts_data['tone']} tone"
+                                )
+                                jr = judge(brand_ctx, judge_q, new_v.get('post_text', ''))
+                                new_v['judge_faithfulness'] = jr.get('faithfulness')
+                                new_v['judge_relevance'] = jr.get('relevance')
+                                new_v['judge_explanation'] = jr.get('explanation', '')
+                                posts_data['variants'][idx - 1] = new_v
+                                _add_display_scores(posts_data['variants'])
+                                st.session_state.generated_posts = posts_data
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Regeneration failed: {e}")
+
+            # Copy button — full-width, uses navigator.clipboard (modern API, works in Streamlit iframes on localhost)
+            text_js = json.dumps(post_text)
+            components.html(
+                f"""<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ height: 38px; overflow: hidden; background: transparent; }}
+  button {{
+    width: 100%; height: 38px;
+    background: #ffffff; color: #31333f;
+    border: 1px solid rgba(49,51,63,0.2); border-radius: 4px;
+    font-size: 14px; font-family: sans-serif; cursor: pointer;
+  }}
+  button:hover {{ background: #f0f2f6; border-color: #31333f; }}
+  button:active {{ background: #e8eaf0; }}
+</style>
+</head>
+<body>
+<button id="cp{idx}" onclick="
+  var btn = document.getElementById('cp{idx}');
+  var text = {text_js};
+  function onOk() {{
+    btn.textContent = '✅ Copied!';
+    setTimeout(function() {{ btn.textContent = '📋 Copy to clipboard'; }}, 2000);
+  }}
+  function onFail() {{
+    btn.textContent = '⚠️ Use Ctrl+C';
+    prompt('Select all and copy (Ctrl+C / Cmd+C):', text);
+    setTimeout(function() {{ btn.textContent = '📋 Copy to clipboard'; }}, 3000);
+  }}
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(text).then(onOk, onFail);
+  }} else {{
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;font-size:12pt;';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length);
+    var ok = false;
+    try {{ ok = document.execCommand('copy'); }} catch(e) {{}}
+    document.body.removeChild(ta);
+    if (ok) {{ onOk(); }} else {{ onFail(); }}
+  }}
+">📋 Copy to clipboard</button>
+</body>
+</html>""",
+                height=38,
+                scrolling=False,
+            )
+
             st.markdown("---")
 
 # ============================================================================
@@ -394,16 +520,16 @@ def screen_metrics():
     st.markdown("---")
     
     # Score and overview
-    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-    
-    score = post_data.get('predicted_score', 0) or 0
+    col_s1, col_s2, col_s3, col_s4, col_s5, col_s6 = st.columns(6)
+
+    display_score = post_data.get('display_score', 0) or 0
     features = post_data.get('features', {})
     scoring_failed = post_data.get('scoring_failed', False)
 
     platform = posts_context['platform'].lower()
 
     with col_s1:
-        st.metric("Predicted Engagement", f"{score:,.0f}" if score else "N/A")
+        st.metric("Engagement Index", f"{display_score}/100" if display_score else "N/A")
     with col_s2:
         st.metric("Sentiment Score",
                   f"{features.get('new_sentiment_score', 0):.2f}",
@@ -412,6 +538,14 @@ def screen_metrics():
         st.metric("Hashtag Count", features.get('hashtag_count', 0))
     with col_s4:
         st.metric("Character Count", features.get('caption_length', 0))
+    with col_s5:
+        j_faith = post_data.get('judge_faithfulness')
+        st.metric("Brand Faithfulness", f"{j_faith}/10" if j_faith else "N/A",
+                  help="LLM judge: alignment with brand guidelines (1-10)")
+    with col_s6:
+        j_rel = post_data.get('judge_relevance')
+        st.metric("Topic Relevance", f"{j_rel}/10" if j_rel else "N/A",
+                  help="LLM judge: how well the post addresses the intended topic (1-10)")
 
     st.markdown("---")
 
@@ -442,18 +576,18 @@ def screen_metrics():
         st.markdown("### Variant Score Comparison")
         all_variants = posts_context['variants']
         var_labels = [f"Variant {i+1}" for i in range(len(all_variants))]
-        var_scores = [v.get('predicted_score', 0) or 0 for v in all_variants]
+        var_scores = [v.get('display_score', 0) or 0 for v in all_variants]
         colors = ['#1E40AF' if v.get('is_recommended') else '#93C5FD'
                   for v in all_variants]
         fig_bar = go.Figure(go.Bar(
             x=var_labels,
             y=var_scores,
             marker_color=colors,
-            text=[f"{s:,.0f}" for s in var_scores],
+            text=[f"{s}/100" for s in var_scores],
             textposition='outside'
         ))
         fig_bar.update_layout(
-            yaxis_title="Predicted Engagement",
+            yaxis_title="Engagement Index (0-100)",
             height=350,
             showlegend=False,
             margin=dict(t=20, b=0, l=0, r=0)
@@ -470,6 +604,7 @@ def screen_metrics():
         has_cta = "✅ Has call-to-action" if features.get('has_cta') else "❌ No call-to-action"
         sentiment = features.get('new_sentiment_score', 0)
         sentiment_label = "✅ Positive tone" if sentiment > 0.2 else "⚠️ Neutral/negative tone"
+        judge_note = post_data.get('judge_explanation', '')
         st.info(f"""
         **Post Analysis:**
         - {has_cta}
@@ -477,6 +612,8 @@ def screen_metrics():
         - {features.get('hashtag_count', 0)} hashtags
         - {features.get('caption_length', 0)} characters
         """)
+        if judge_note and "unavailable" not in judge_note:
+            st.caption(f"**AI Judge:** _{judge_note}_")
 
     with col_i2:
         from modules.predictor import get_best_posting_time
@@ -488,28 +625,6 @@ def screen_metrics():
         - Test A/B variants to optimise performance
         """)
 
-    st.markdown("---")
-    col_a2, col_a3 = st.columns(2)
-
-    with col_a2:
-        if st.button("✏️ Edit Content", use_container_width=True, key="metrics_edit_btn"):
-            st.session_state.screen = 'output'
-            st.rerun()
-
-    with col_a3:
-        if st.button("🔄 Generate New", use_container_width=True, key="metrics_generate_btn"):
-            st.session_state.screen = 'input'
-            st.session_state.generated_posts = None
-            st.rerun()
-    
-    with col_a2:
-        if st.button("✏️ Edit Content", use_container_width=True):
-            st.session_state.screen = 'output'
-            st.rerun()
-    
-    with col_a3:
-        if st.button("📥 Export Report", use_container_width=True):
-            st.success("📥 Analytics report downloaded!")
 
 # ============================================================================
 # MAIN APP LOGIC
