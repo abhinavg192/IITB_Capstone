@@ -139,7 +139,27 @@ def load_model(model_version: str = 'manas'):
 # PREDICTION
 # ─────────────────────────────────────────────────────────────
 
-def predict_engagement(features_dict: dict, model_version: str = 'manas') -> float:
+def _predict_with_version(features_dict: dict, version: str) -> float:
+    """Internal helper — runs prediction for a specific model version."""
+    model, train_columns = load_model(version)
+    model_features = {
+        'caption_length':      features_dict['caption_length'],
+        'hashtag_count':       features_dict['hashtag_count'],
+        'new_sentiment_score': features_dict['new_sentiment_score'],
+        'has_cta':             features_dict['has_cta'],
+        'platform_encoded':    features_dict['platform_encoded'],
+        'hour_posted':         features_dict['hour_posted']
+    }
+    input_df = pd.DataFrame([model_features])
+    input_df['hour_posted']      = input_df['hour_posted'].astype('category')
+    input_df['platform_encoded'] = input_df['platform_encoded'].astype('category')
+    processed = pd.get_dummies(input_df, columns=['hour_posted', 'platform_encoded'], drop_first=True)
+    processed = processed.reindex(columns=train_columns, fill_value=0)
+    log_pred  = model.predict(processed)[0]
+    return max(0.0, round(float(np.expm1(log_pred)), 4))
+
+
+def predict_engagement(features_dict: dict, model_version: str = 'auto') -> float:
     """
     Predicts engagement score for a post using a pre-trained XGBoost model.
     Called by optimize_variants() in pipeline.py.
@@ -152,8 +172,8 @@ def predict_engagement(features_dict: dict, model_version: str = 'manas') -> flo
             - has_cta (int)            0 or 1
             - platform_encoded (int)   0=Twitter 1=LinkedIn 2=Instagram
             - hour_posted (int)        0-23
-        model_version (str): 'manas' (default) or 'khushee'
-                             Switch to compare which model yields better results.
+        model_version (str): 'auto' (default) — picks whichever model scores higher.
+                             'manas' or 'khushee' to force a specific model.
 
     Returns:
         float: predicted engagement score
@@ -163,39 +183,12 @@ def predict_engagement(features_dict: dict, model_version: str = 'manas') -> flo
     Raises:
         FileNotFoundError: if model pkl files missing
     """
-    model, train_columns = load_model(model_version)
+    if model_version == 'auto':
+        score_manas   = _predict_with_version(features_dict, 'manas')
+        score_khushee = _predict_with_version(features_dict, 'khushee')
+        return max(score_manas, score_khushee)
 
-    # Extract only the 6 features the model needs
-    model_features = {
-        'caption_length':      features_dict['caption_length'],
-        'hashtag_count':       features_dict['hashtag_count'],
-        'new_sentiment_score': features_dict['new_sentiment_score'],
-        'has_cta':             features_dict['has_cta'],
-        'platform_encoded':    features_dict['platform_encoded'],
-        'hour_posted':         features_dict['hour_posted']
-    }
-
-    # Build input DataFrame
-    input_df = pd.DataFrame([model_features])
-
-    # One-hot encode to match training schema
-    input_df['hour_posted']      = input_df['hour_posted'].astype('category')
-    input_df['platform_encoded'] = input_df['platform_encoded'].astype('category')
-
-    processed = pd.get_dummies(
-        input_df,
-        columns=['hour_posted', 'platform_encoded'],
-        drop_first=True
-    )
-
-    # Align columns exactly with training data
-    processed = processed.reindex(columns=train_columns, fill_value=0)
-
-    # Predict and inverse transform from log scale
-    log_pred = model.predict(processed)[0]
-    score    = float(np.expm1(log_pred))
-
-    return max(0.0, round(score, 4))
+    return _predict_with_version(features_dict, model_version)
 
 
 # ─────────────────────────────────────────────────────────────
