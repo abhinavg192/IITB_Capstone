@@ -159,7 +159,7 @@ def _predict_with_version(features_dict: dict, version: str) -> float:
     return max(0.0, round(float(np.expm1(log_pred)), 4))
 
 
-def predict_engagement(features_dict: dict, model_version: str = 'khushee') -> float:
+def predict_engagement(features_dict: dict, model_version: str = 'auto') -> float:
     """
     Predicts engagement score for a post using a pre-trained XGBoost model.
     Called by optimize_variants() in pipeline.py.
