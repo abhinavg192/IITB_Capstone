@@ -151,15 +151,15 @@ def _predict_with_version(features_dict: dict, version: str) -> float:
         'hour_posted':         features_dict['hour_posted']
     }
     input_df = pd.DataFrame([model_features])
-    input_df['hour_posted']      = pd.Categorical([model_features['hour_posted']], categories=list(range(24)))
-    input_df['platform_encoded'] = pd.Categorical([model_features['platform_encoded']], categories=[0, 1, 2])
+    input_df['hour_posted']      = input_df['hour_posted'].astype('category')
+    input_df['platform_encoded'] = input_df['platform_encoded'].astype('category')
     processed = pd.get_dummies(input_df, columns=['hour_posted', 'platform_encoded'], drop_first=True)
     processed = processed.reindex(columns=train_columns, fill_value=0)
     log_pred  = model.predict(processed)[0]
     return max(0.0, round(float(np.expm1(log_pred)), 4))
 
 
-def predict_engagement(features_dict: dict, model_version: str = 'auto') -> float:
+def predict_engagement(features_dict: dict, model_version: str = 'khushee') -> float:
     """
     Predicts engagement score for a post using a pre-trained XGBoost model.
     Called by optimize_variants() in pipeline.py.
