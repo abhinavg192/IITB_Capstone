@@ -2,6 +2,14 @@
 AI Social Media Content Generator - Streamlit Dashboard
 Three screens: Input Form → Output Variants → Engagement Metrics
 """
+import os
+import sys
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+
+# Add repo root to path so modules/ is importable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import streamlit as st
 import pandas as pd
@@ -13,6 +21,8 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from modules.predictor import predict_engagement
+from modules.pipeline import generate_posts, optimize_variants
+from modules.rag import build_index, retrieve_brand_context, is_index_built
 
 # Initialize NLTK VADER
 try:
@@ -86,276 +96,53 @@ if 'generated_posts' not in st.session_state:
 if 'selected_post' not in st.session_state:
     st.session_state.selected_post = None
 
-# Mock AI generation function (replace with actual LLM call)
-def generate_posts(brand, topic, platform, tone):
+def run_pipeline(brand, topic, platform, tone, pdf_path=None):
     """
-    Mock function to generate social media posts
-    In production, this would call GPT-4/Claude API
+    Calls real Claude pipeline to generate 5 post variants.
+    Returns list of variant dicts with post_text, hashtags,
+    tone, suggested_posting_time, predicted_score, is_recommended.
     """
-    
-    def parse_hour(time_str):
-        import re
-        match = re.search(r'(\d+):00\s*(AM|PM)', time_str)
-        if match:
-            hour = int(match.group(1))
-            if match.group(2) == 'PM' and hour != 12:
-                hour += 12
-            elif match.group(2) == 'AM' and hour == 12:
-                hour = 0
-            return hour
-        return 12  # default
-    
-    cta_keywords = ['link', 'register', 'learn more', 'sign up', 'click here', 'visit', 'download', 'bio', 'get started']
-    platform_encoded = 0 if platform == 'twitter' else 1
-    
-    # Different variants with predicted scores
-    variants = {
-        'twitter': [
-            {
-                'content': f"Exciting news about {topic}! 🚀 {brand} is leading the way in innovation. What are your thoughts? #Innovation #{brand}",
-                'hashtags': '#Innovation #' + brand,
-                'char_count': 127,
-                'best_time': '2:00 PM - 4:00 PM EST',
-                'predicted_engagement': {'likes': 450, 'retweets': 120, 'replies': 35}
-            },
-            {
-                'content': f"Big things happening at {brand}! Our latest work on {topic} is changing the game. Join the conversation 💪 #{brand}Community",
-                'hashtags': '#' + brand + 'Community',
-                'char_count': 134,
-                'best_time': '11:00 AM - 1:00 PM EST',
-                'predicted_engagement': {'likes': 380, 'retweets': 95, 'replies': 28}
-            },
-            {
-                'content': f"Did you know? {brand}'s approach to {topic} is revolutionizing the industry. Learn more → [link] #TechNews #{brand}",
-                'hashtags': '#TechNews #' + brand,
-                'char_count': 125,
-                'best_time': '9:00 AM - 11:00 AM EST',
-                'predicted_engagement': {'likes': 320, 'retweets': 78, 'replies': 22}
-            },
-            {
-                'content': f"🎯 {brand} + {topic} = Innovation at its finest. Here's what makes our approach different: [thread]",
-                'hashtags': '',
-                'char_count': 98,
-                'best_time': '3:00 PM - 5:00 PM EST',
-                'predicted_engagement': {'likes': 290, 'retweets': 65, 'replies': 18}
-            },
-            {
-                'content': f"Transforming {topic} one step at a time. {brand} is committed to excellence. #Innovation #Excellence #{brand}",
-                'hashtags': '#Innovation #Excellence #' + brand,
-                'char_count': 115,
-                'best_time': '5:00 PM - 7:00 PM EST',
-                'predicted_engagement': {'likes': 250, 'retweets': 55, 'replies': 15}
-            }
-        ],
-        'linkedin': [
-            {
-                'content': f"""I'm excited to share our latest insights on {topic}. 
 
-At {brand}, we believe that innovation comes from understanding both the technical challenges and human needs. Our recent work demonstrates how a data-driven approach can transform outcomes.
+    # Generate 5 variants via Claude
+    variants = generate_posts(
+        brand_name=brand,
+        topic=topic,
+        tone=tone,
+        platform=platform.lower(),
+        pdf_path=pdf_path
+    )
 
-Key takeaways:
-- Strategic implementation matters more than technology alone
-- Cross-functional collaboration drives success
-- Continuous learning is essential
-
-What's your experience with {topic}? I'd love to hear your thoughts.
-
-#Innovation #Leadership #{brand}""",
-                'hashtags': '#Innovation #Leadership #' + brand,
-                'char_count': 456,
-                'best_time': '8:00 AM - 10:00 AM EST',
-                'predicted_engagement': {'likes': 680, 'comments': 45, 'shares': 120}
-            },
-            {
-                'content': f"""The future of {topic} is here, and {brand} is at the forefront.
-
-Our team has spent the last quarter developing solutions that address real-world challenges. The results speak for themselves:
-
-→ Increased efficiency by 40%
-→ Reduced time-to-market by 30%
-→ Enhanced customer satisfaction scores
-
-Proud of what we've built together. Here's to continued innovation!
-
-#{brand} #Innovation #BusinessGrowth""",
-                'hashtags': '#' + brand + ' #Innovation #BusinessGrowth',
-                'char_count': 423,
-                'best_time': '12:00 PM - 2:00 PM EST',
-                'predicted_engagement': {'likes': 580, 'comments': 38, 'shares': 95}
-            },
-            {
-                'content': f"""Sharing some reflections on {topic} and what it means for the industry.
-
-At {brand}, we've learned that success requires:
-1. Clear vision
-2. Adaptable strategy  
-3. Strong team collaboration
-
-The landscape is evolving rapidly, and those who adapt will thrive.
-
-What trends are you seeing in your field?
-
-#ThoughtLeadership #{brand}""",
-                'hashtags': '#ThoughtLeadership #' + brand,
-                'char_count': 356,
-                'best_time': '10:00 AM - 12:00 PM EST',
-                'predicted_engagement': {'likes': 490, 'comments': 32, 'shares': 78}
-            },
-            {
-                'content': f"""{brand} is transforming the way we approach {topic}.
-
-Our methodology combines proven practices with innovative thinking. The results? Better outcomes, faster delivery, and more satisfied stakeholders.
-
-Interested in learning more? Let's connect.
-
-#Innovation #{brand}""",
-                'hashtags': '#Innovation #' + brand,
-                'char_count': 298,
-                'best_time': '2:00 PM - 4:00 PM EST',
-                'predicted_engagement': {'likes': 420, 'comments': 28, 'shares': 65}
-            }
-        ],
-
-        'instagram': [
-            {
-                'content': f"""✨ Big news from {brand}! ✨
-
-We're thrilled to share our latest work on {topic}. Swipe to see behind-the-scenes moments from our team bringing this vision to life. 
-
-From concept to reality, every step has been an incredible journey. Thank you to everyone who made this possible! 🙏
-
-What would you like to see next? Drop your ideas in the comments! 👇
-
-etc.
-
-#Innovation #BehindTheScenes #{brand} #CreativeProcess #TeamWork #Vision #Progress #Community""",
-                'hashtags': '#Innovation #BehindTheScenes #' + brand + ' #CreativeProcess #TeamWork #Vision #Progress #Community',
-                'char_count': 512,
-                'best_time': '11:00 AM - 1:00 PM EST',
-                'predicted_engagement': {'likes': 1250, 'comments': 85, 'shares': 42}
-            },
-            {
-                'content': f"""The future is here. 🚀
-
-{brand} is reimagining {topic} and we couldn't be more excited about what's coming next.
-
-Tag someone who needs to see this! 
-
-#{brand} #Innovation #Future #Inspiration #Goals""",
-                'hashtags': '#' + brand + ' #Innovation #Future #Inspiration #Goals',
-                'char_count': 268,
-                'best_time': '7:00 PM - 9:00 PM EST',
-                'predicted_engagement': {'likes': 980, 'comments': 68, 'shares': 35}
-            },
-            {
-                'content': f"""When innovation meets passion 💙
-
-Our team at {brand} has been working hard on {topic}, and we can't wait to share more with you soon!
-
-Stay tuned for updates. 
-
-#{brand}Community #Innovation #ComingSoon #Excited""",
-                'hashtags': '#' + brand + 'Community #Innovation #ComingSoon #Excited',
-                'char_count': 289,
-                'best_time': '5:00 PM - 7:00 PM EST',
-                'predicted_engagement': {'likes': 820, 'comments': 54, 'shares': 28}
-            },
-            {
-                'content': f"""Making waves in {topic} 🌊
-
-{brand} is committed to excellence and innovation. Here's a glimpse of what we've been up to!
-
-#{brand} #Excellence #Innovation""",
-                'hashtags': '#' + brand + ' #Excellence #Innovation',
-                'char_count': 198,
-                'best_time': '3:00 PM - 5:00 PM EST',
-                'predicted_engagement': {'likes': 680, 'comments': 42, 'shares': 22}
-            },
-            {
-                'content': f"""New chapter, same dedication 📖
-
-{brand} continues to push boundaries in {topic}. More updates coming!
-
-#{brand} #Progress""",
-                'hashtags': '#' + brand + ' #Progress',
-                'char_count': 156,
-                'best_time': '1:00 PM - 3:00 PM EST',
-                'predicted_engagement': {'likes': 520, 'comments': 35, 'shares': 18}
-            }
-        ]
-    }
-    
-    # Predict engagement for each variant
-    raw_scores = []
-    for variant in variants[platform.lower()]:
-        content = variant['content']
-        caption_length = len(content)
-        hashtag_count = len(re.findall(r'#\w+', content))
-        sentiment_score = analyzer.polarity_scores(content)['compound']
-        has_cta = 1 if any(keyword in content.lower() for keyword in cta_keywords) else 0
-        hour_posted = parse_hour(variant['best_time'])
-        
-        features_dict = {
-            'caption_length': caption_length,
-            'hashtag_count': hashtag_count,
-            'new_sentiment_score': sentiment_score,
-            'has_cta': has_cta,
-            'platform_encoded': platform_encoded,
-            'hour_posted': hour_posted
-        }
-        
-        predicted = predict_engagement(features_dict)
-        variant['raw_score'] = predicted
-        variant['predicted_engagement'] = derive_engagement_metrics(predicted, platform.lower())
-        raw_scores.append(predicted)
-
-    normalized_scores = normalize_scores(raw_scores)
-    for variant, normalized in zip(variants[platform.lower()], normalized_scores):
-        variant['score'] = normalized
-    
-    return variants.get(platform.lower(), variants['twitter'])
-
-def normalize_scores(raw_scores):
-    """Normalize raw model predictions to a 0-100 variant score range."""
-    if not raw_scores:
+    if not variants:
         return []
-    min_raw = min(raw_scores)
-    max_raw = max(raw_scores)
-    if max_raw <= min_raw:
-        return [100.0] * len(raw_scores)
-    return [round((score - min_raw) / (max_raw - min_raw) * 100, 2) for score in raw_scores]
+
+    # Score and rank via XGBoost
+    ranked, scores, scoring_failed = optimize_variants(
+        variants,
+        platform.lower()
+    )
+
+    # Add scoring_failed flag to each variant
+    for v in ranked:
+        v['scoring_failed'] = scoring_failed
+
+    return ranked
 
 
-def derive_engagement_metrics(raw_score, platform):
-    """Generate a simple engagement breakdown from the model's raw prediction."""
-    if platform == 'twitter':
-        return {
-            'likes': int(round(raw_score * 100 + 80)),
-            'retweets': int(round(raw_score * 24 + 14)),
-            'replies': int(round(raw_score * 8 + 6))
-        }
-    elif platform == 'linkedin':
-        return {
-            'likes': int(round(raw_score * 120 + 90)),
-            'comments': int(round(raw_score * 16 + 12)),
-            'shares': int(round(raw_score * 10 + 8))
-        }
-    else:
-        return {
-            'likes': int(round(raw_score * 140 + 100)),
-            'comments': int(round(raw_score * 14 + 10)),
-            'shares': int(round(raw_score * 12 + 9))
-        }
-
-
-def get_score_class(score):
-    """Return CSS class based on score"""
-    if score >= 85:
-        return 'score-high'
-    elif score >= 75:
+def get_score_class(score, all_scores):
+    """
+    Returns CSS class based on relative score among all 5 variants.
+    Top variant = green, bottom = red, rest = yellow.
+    """
+    if not all_scores or len(all_scores) < 2:
         return 'score-medium'
-    else:
+    max_score = max(all_scores)
+    min_score = min(all_scores)
+    if score == max_score:
+        return 'score-high'
+    elif score == min_score:
         return 'score-low'
+    else:
+        return 'score-medium'
 
 # ============================================================================
 # SCREEN 1: INPUT FORM
@@ -401,7 +188,32 @@ def screen_input():
             options=["Professional", "Casual & Friendly", "Inspirational", "Educational", "Promotional"],
             help="Select the desired tone for your content"
         )
-        
+
+        st.markdown("---")
+        st.markdown("### Brand Voice (Optional)")
+        st.caption("Upload your brand guidelines PDF to align posts with your brand voice.")
+
+        uploaded_pdf = st.file_uploader(
+            "Upload Brand Guidelines PDF",
+            type=["pdf"],
+            help="PDF will be indexed using RAG to extract brand voice guidelines"
+        )
+
+        if uploaded_pdf:
+            import tempfile
+            if brand and not is_index_built(brand):
+                with st.spinner(f"Building brand voice index for {brand}..."):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(uploaded_pdf.read())
+                        tmp_path = tmp.name
+                    st.session_state.pdf_path = tmp_path
+                    build_index(tmp_path, brand)
+                    st.success(f"✅ Brand voice indexed for {brand}!")
+            elif brand and is_index_built(brand):
+                st.success(f"✅ Brand voice already indexed for {brand}")
+            else:
+                st.warning("⚠️ Enter brand name above before uploading PDF")
+
     with col2:
         st.markdown("### Quick Tips")
         st.info("""
@@ -433,12 +245,8 @@ def screen_input():
                 st.error("⚠️ Please fill in both Brand Name and Topic")
             else:
                 with st.spinner("Generating AI-powered content variants..."):
-                    # Simulate API call delay
-                    import time
-                    time.sleep(1.5)
-                    
                     # Generate posts
-                    posts = generate_posts(brand, topic, platform, tone)
+                    posts = run_pipeline(brand, topic, platform, tone, pdf_path=st.session_state.get('pdf_path'))
                     
                     st.session_state.generated_posts = {
                         'brand': brand,
@@ -485,8 +293,16 @@ def screen_output():
         st.markdown('<p class="main-header">📝 Generated Content Variants</p>', unsafe_allow_html=True)
         st.markdown(f'<p class="sub-header">Platform: {posts_data["platform"]} | Tone: {posts_data["tone"]}</p>', unsafe_allow_html=True)
     with col2:
-        if st.button("← Back to Input", use_container_width=True):
+        if st.button("← Back to Input", use_container_width=True, key="output_back_btn"):
             st.session_state.screen = 'input'
+            st.rerun()
+        if st.button("📊 View Analytics", use_container_width=True, key="view_analytics_btn"):
+            recommended = next(
+                (v for v in posts_data['variants'] if v.get('is_recommended')),
+                posts_data['variants'][0]
+            )
+            st.session_state.selected_post = recommended
+            st.session_state.screen = 'metrics'
             st.rerun()
     
     # Show context
@@ -503,28 +319,25 @@ def screen_output():
     
     # Display variants
     for idx, variant in enumerate(posts_data['variants'], 1):
-        score = variant['score']
-        score_class = get_score_class(score)
+        score = variant.get('predicted_score', 0) or 0
+        all_scores = [v.get('predicted_score', 0) or 0 for v in posts_data['variants']]
+        score_class = get_score_class(score, all_scores)
         
         with st.container():
             # Header row with variant number and score
-            col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
+            col_h1, col_h2 = st.columns([3, 1])
             
             with col_h1:
                 st.markdown(f"#### Variant {idx}")
             with col_h2:
-                st.markdown(f'<span class="score-badge {score_class}">Score: {score}/100</span>', unsafe_allow_html=True)
-            with col_h3:
-                if st.button(f"📊 View Analytics", key=f"analytics_{idx}", use_container_width=True):
-                    st.session_state.selected_post = variant
-                    st.session_state.screen = 'metrics'
-                    st.rerun()
+                recommended = "⭐ " if variant.get('is_recommended') else ""
+                st.markdown(f'<span class="score-badge {score_class}">{recommended}Score: {score:,.0f}</span>', unsafe_allow_html=True)
             
             # Content
             st.markdown("**Content:**")
             st.text_area(
                 "Content",
-                value=variant['content'],
+                value=variant.get('post_text', ''),
                 height=150,
                 key=f"content_{idx}",
                 label_visibility="collapsed"
@@ -533,11 +346,12 @@ def screen_output():
             # Metadata
             col_m1, col_m2, col_m3 = st.columns(3)
             with col_m1:
-                st.caption(f"📏 {variant['char_count']} characters")
+                st.caption(f"📏 {len(variant.get('post_text', ''))} characters")
             with col_m2:
-                st.caption(f"⏰ Best time: {variant['best_time']}")
+                st.caption(f"⏰ {variant.get('suggested_posting_time', 'N/A')}")
             with col_m3:
-                st.caption(f"🏷️ {variant['hashtags'] if variant['hashtags'] else 'No hashtags'}")
+                hashtags = ' '.join(variant.get('hashtags', []))
+                st.caption(f"🏷️ {hashtags if hashtags else 'No hashtags'}")
             
             # Action buttons
             col_b1, col_b2, col_b3, col_b4 = st.columns(4)
@@ -572,179 +386,121 @@ def screen_metrics():
         st.markdown('<p class="main-header">📊 Engagement Analytics</p>', unsafe_allow_html=True)
         st.markdown('<p class="sub-header">Predicted performance metrics and insights</p>', unsafe_allow_html=True)
     with col2:
-        if st.button("← Back to Variants", use_container_width=True):
+        if st.button("← Back to Variants", use_container_width=True, key="metrics_back_btn"):
             st.session_state.screen = 'output'
             st.rerun()
+        
     
     st.markdown("---")
     
     # Score and overview
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     
-    score = post_data['score']
-    engagement = post_data['predicted_engagement']
-    
+    score = post_data.get('predicted_score', 0) or 0
+    features = post_data.get('features', {})
+    scoring_failed = post_data.get('scoring_failed', False)
+
     platform = posts_context['platform'].lower()
-    
+
     with col_s1:
-        st.metric("Engagement Score", f"{score}/100", delta="8% above avg")
-    
-    if platform == 'twitter':
-        with col_s2:
-            st.metric("Predicted Likes", f"{engagement['likes']:,}", delta="+15%")
-        with col_s3:
-            st.metric("Predicted Retweets", f"{engagement['retweets']:,}", delta="+12%")
-        with col_s4:
-            st.metric("Predicted Replies", f"{engagement['replies']:,}", delta="+5%")
-    elif platform == 'linkedin':
-        with col_s2:
-            st.metric("Predicted Likes", f"{engagement['likes']:,}", delta="+18%")
-        with col_s3:
-            st.metric("Predicted Comments", f"{engagement['comments']:,}", delta="+10%")
-        with col_s4:
-            st.metric("Predicted Shares", f"{engagement['shares']:,}", delta="+14%")
-    else:  # instagram
-        with col_s2:
-            st.metric("Predicted Likes", f"{engagement['likes']:,}", delta="+20%")
-        with col_s3:
-            st.metric("Predicted Comments", f"{engagement['comments']:,}", delta="+16%")
-        with col_s4:
-            st.metric("Predicted Shares", f"{engagement['shares']:,}", delta="+8%")
-    
+        st.metric("Predicted Engagement", f"{score:,.0f}" if score else "N/A")
+    with col_s2:
+        st.metric("Sentiment Score",
+                  f"{features.get('new_sentiment_score', 0):.2f}",
+                  help="+1 very positive, -1 very negative")
+    with col_s3:
+        st.metric("Hashtag Count", features.get('hashtag_count', 0))
+    with col_s4:
+        st.metric("Character Count", features.get('caption_length', 0))
+
     st.markdown("---")
-    
-    # Two columns for charts
+
     col_chart1, col_chart2 = st.columns(2)
-    
+
     with col_chart1:
-        st.markdown("### Predicted Engagement Breakdown")
-        
-        # Engagement pie chart
-        if platform == 'twitter':
-            labels = ['Likes', 'Retweets', 'Replies']
-            values = [engagement['likes'], engagement['retweets'], engagement['replies']]
-        elif platform == 'linkedin':
-            labels = ['Likes', 'Comments', 'Shares']
-            values = [engagement['likes'], engagement['comments'], engagement['shares']]
-        else:
-            labels = ['Likes', 'Comments', 'Shares']
-            values = [engagement['likes'], engagement['comments'], engagement['shares']]
-        
-        fig_pie = go.Figure(data=[go.Pie(
-            labels=labels,
-            values=values,
-            hole=0.4,
-            marker=dict(colors=['#3B82F6', '#10B981', '#F59E0B'])
+        st.markdown("### Feature Breakdown")
+        feat_labels = ['Sentiment', 'Has CTA', 'Has Question', 'Has Emoji']
+        feat_values = [
+            max(0, features.get('new_sentiment_score', 0)),
+            features.get('has_cta', 0),
+            features.get('has_question', 0),
+            features.get('has_emoji', 0)
+        ]
+        fig_pie = go.Figure(data=[go.Bar(
+            x=feat_labels,
+            y=feat_values,
+            marker_color=['#3B82F6', '#10B981', '#F59E0B', '#EF4444']
         )])
-        
         fig_pie.update_layout(
-            showlegend=True,
             height=350,
-            margin=dict(t=0, b=0, l=0, r=0)
+            showlegend=False,
+            margin=dict(t=20, b=0, l=0, r=0)
         )
-        
         st.plotly_chart(fig_pie, use_container_width=True)
-    
+
     with col_chart2:
-        st.markdown("### Engagement Over Time (Predicted)")
-        
-        # Time series prediction
-        hours = list(range(24))
-        base_engagement = sum(values)
-        
-        # Simulate engagement curve
-        engagement_curve = []
-        for h in hours:
-            if 9 <= h <= 17:  # Peak hours
-                engagement_curve.append(base_engagement * 0.8 + random.randint(-50, 100))
-            elif 18 <= h <= 22:  # Evening
-                engagement_curve.append(base_engagement * 0.5 + random.randint(-30, 80))
-            else:  # Off hours
-                engagement_curve.append(base_engagement * 0.2 + random.randint(-20, 50))
-        
-        fig_time = go.Figure()
-        fig_time.add_trace(go.Scatter(
-            x=hours,
-            y=engagement_curve,
-            mode='lines',
-            fill='tozeroy',
-            line=dict(color='#3B82F6', width=2),
-            name='Predicted Engagement'
+        st.markdown("### Variant Score Comparison")
+        all_variants = posts_context['variants']
+        var_labels = [f"Variant {i+1}" for i in range(len(all_variants))]
+        var_scores = [v.get('predicted_score', 0) or 0 for v in all_variants]
+        colors = ['#1E40AF' if v.get('is_recommended') else '#93C5FD'
+                  for v in all_variants]
+        fig_bar = go.Figure(go.Bar(
+            x=var_labels,
+            y=var_scores,
+            marker_color=colors,
+            text=[f"{s:,.0f}" for s in var_scores],
+            textposition='outside'
         ))
-        
-        fig_time.update_layout(
-            xaxis_title="Hour of Day",
-            yaxis_title="Engagement Count",
+        fig_bar.update_layout(
+            yaxis_title="Predicted Engagement",
             height=350,
-            margin=dict(t=20, b=0, l=0, r=0),
-            showlegend=False
+            showlegend=False,
+            margin=dict(t=20, b=0, l=0, r=0)
         )
-        
-        st.plotly_chart(fig_time, use_container_width=True)
-    
-    # Comparison with other variants
+        st.plotly_chart(fig_bar, use_container_width=True)
+        st.caption("Dark blue = recommended variant")
+
     st.markdown("---")
-    st.markdown("### Variant Comparison")
-    
-    # Create comparison data
-    all_variants = posts_context['variants']
-    comparison_data = {
-        'Variant': [f'Variant {i+1}' for i in range(len(all_variants))],
-        'Score': [v['score'] for v in all_variants],
-        'Engagement': [sum(v['predicted_engagement'].values()) for v in all_variants]
-    }
-    
-    df_comparison = pd.DataFrame(comparison_data)
-    
-    # Bar chart comparison
-    fig_compare = go.Figure()
-    
-    fig_compare.add_trace(go.Bar(
-        x=df_comparison['Variant'],
-        y=df_comparison['Score'],
-        name='Engagement Score',
-        marker_color='#3B82F6'
-    ))
-    
-    fig_compare.update_layout(
-        xaxis_title="Variant",
-        yaxis_title="Score",
-        height=300,
-        showlegend=False
-    )
-    
-    st.plotly_chart(fig_compare, use_container_width=True)
-    
-    # AI Insights
-    st.markdown("---")
-    st.markdown("### 🤖 AI-Generated Insights")
-    
+    st.markdown("### 🤖 AI Insights")
+
     col_i1, col_i2 = st.columns(2)
-    
+
     with col_i1:
+        has_cta = "✅ Has call-to-action" if features.get('has_cta') else "❌ No call-to-action"
+        sentiment = features.get('new_sentiment_score', 0)
+        sentiment_label = "✅ Positive tone" if sentiment > 0.2 else "⚠️ Neutral/negative tone"
         st.info(f"""
-        **Strengths:**
-        - High engagement score ({score}/100)
-        - Optimal character length for {posts_context['platform']}
-        - Strong call-to-action present
-        - Appropriate hashtag usage
+        **Post Analysis:**
+        - {has_cta}
+        - {sentiment_label} ({sentiment:.2f})
+        - {features.get('hashtag_count', 0)} hashtags
+        - {features.get('caption_length', 0)} characters
         """)
-    
+
     with col_i2:
+        from modules.predictor import get_best_posting_time
+        best_time = get_best_posting_time(platform)
         st.warning(f"""
         **Suggestions:**
-        - Consider posting at {post_data['best_time']} for maximum reach
-        - Add more visual elements (emoji/images) to increase engagement
-        - Test A/B variants to optimize performance
+        - Best posting time: {best_time}
+        - Add more emojis to boost Instagram/Twitter engagement
+        - Test A/B variants to optimise performance
         """)
-    
-    # Action buttons
+
     st.markdown("---")
-    col_a1, col_a2, col_a3 = st.columns(3)
-    
-    with col_a1:
-        if st.button("✅ Approve & Schedule", type="primary", use_container_width=True):
-            st.success(f"✅ Post scheduled for {post_data['best_time']}!")
+    col_a2, col_a3 = st.columns(2)
+
+    with col_a2:
+        if st.button("✏️ Edit Content", use_container_width=True, key="metrics_edit_btn"):
+            st.session_state.screen = 'output'
+            st.rerun()
+
+    with col_a3:
+        if st.button("🔄 Generate New", use_container_width=True, key="metrics_generate_btn"):
+            st.session_state.screen = 'input'
+            st.session_state.generated_posts = None
+            st.rerun()
     
     with col_a2:
         if st.button("✏️ Edit Content", use_container_width=True):
