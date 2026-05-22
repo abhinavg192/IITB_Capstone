@@ -1,346 +1,880 @@
 """
-modules/predictor.py
-XGBoost Engagement Predictor
-Loads Manas's pre-trained model and provides predict_engagement() wrapper.
+modules/pipeline.py
+AI Social Media Content Generation Pipeline
+Extracted from notebooks/abhinav/prompt_template_pipeline.ipynb
 
-Usage:
-    from modules.predictor import predict_engagement
-    from modules.predictor import extract_features_from_raw
-    from modules.predictor import get_optimal_posting_hour
-    from modules.predictor import get_best_posting_time
-    from modules.predictor import get_feature_importance
+Provides:
+    - generate_posts()     → generates 5 post variants via Claude
+    - optimize_variants()  → scores and ranks variants via XGBoost
+    - get_examples()       → returns few-shot examples per platform
 
-Author: Manas Sandeep Rane (modularized by Abhinav Gupta)
+Author: Abhinav Gupta | IITB Capstone 2026
 """
 
 import os
-import pickle
-import numpy as np
-import pandas as pd
+import re
+import json
+import sys
 
-import ssl
-import nltk
-
-try:
-    ssl._create_default_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
-
-try:
-    nltk.data.find('sentiment/vader_lexicon.zip')
-except LookupError:
-    nltk.download('vader_lexicon', quiet=True)
-
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-
-_vader = SentimentIntensityAnalyzer()
-
-_CTA_KEYWORDS = [
-    'link', 'register', 'learn more', 'sign up', 'click here',
-    'visit', 'download', 'bio', 'get started', 'click',
-    'discover', 'explore', 'try', 'get', 'join', 'shop',
-    'buy', 'check out', 'read', 'watch', 'follow', 'share',
-    'comment below', 'dm us', 'subscribe', 'link in bio'
-]
+from dotenv import load_dotenv
+from langchain_core.prompts import PromptTemplate
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage
 
 # ─────────────────────────────────────────────────────────────
-# ENVIRONMENT — must be set before xgboost import
-# Prevents libomp conflicts on Mac ARM
+# ENVIRONMENT SETUP
+# Must be set before any other imports to prevent
+# libomp conflicts on Mac ARM (torch + faiss + xgboost)
 # ─────────────────────────────────────────────────────────────
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURATION
+# API KEY LOADING
 # ─────────────────────────────────────────────────────────────
 
-# Features Manas's model was trained on — must match exactly
-MODEL_FEATURES = [
-    'caption_length',
-    'hashtag_count',
-    'new_sentiment_score',  # VADER compound score
-    'has_cta',
-    'platform_encoded',     # 0=Twitter, 1=LinkedIn, 2=Instagram
-    'hour_posted'           # 0-23
-]
+def _load_api_keys():
+    """Load API keys from .env file in repo root."""
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..')
+    )
+    env_path = os.path.join(repo_root, '.env')
+    load_dotenv(dotenv_path=env_path)
 
-# Model file paths
-MODEL_DIR     = os.path.join(os.path.dirname(__file__), '..', 'models')
-
-# Manas's model
-MODEL_PATH    = os.path.join(MODEL_DIR, 'xgboost_model.pkl')
-COLUMNS_PATH  = os.path.join(MODEL_DIR, 'xgboost_columns.pkl')
-
-# Khushee's model
-MODEL_PATH_K   = os.path.join(MODEL_DIR, 'xgboost_engagement.pkl')
-COLUMNS_PATH_K = os.path.join(MODEL_DIR, 'xgboost_engagement_columns.pkl')
-
-# Cached models — loaded once per session
-_model         = None
-_train_columns = None
-_model_k         = None
-_train_columns_k = None
-
+    anthropic_key = os.getenv('ANTHROPIC_API_KEY')
+    if not anthropic_key:
+        raise EnvironmentError(
+            "ANTHROPIC_API_KEY not found. "
+            "Check your .env file in the repo root."
+        )
+    return anthropic_key
 
 # ─────────────────────────────────────────────────────────────
-# MODEL LOADING
+# LLM INITIALIZATION
 # ─────────────────────────────────────────────────────────────
 
-def load_model(model_version: str = 'manas'):
+def _init_llm(model: str = "claude-haiku-4-5-20251001") -> ChatAnthropic:
     """
-    Loads a pre-trained XGBoost model from disk.
-    Caches in memory after first load.
-
-    Args:
-        model_version (str): 'manas' (default) or 'khushee'
-                             Switch to compare which model yields better results.
-
-    Returns:
-        tuple: (model, train_columns)
-
-    Raises:
-        FileNotFoundError: if pkl files not found in models/
-        ValueError: if model_version is not recognised
+    Initialize Claude LLM.
+    Default: claude-haiku-4-5-20251001 (dev/cost efficient)
+    Production: claude-sonnet-4-6 (higher quality)
     """
-    global _model, _train_columns, _model_k, _train_columns_k
+    api_key = _load_api_keys()
+    return ChatAnthropic(
+        model=model,
+        api_key=api_key,
+        max_tokens=4000
+    )
 
-    if model_version == 'manas':
-        if _model is not None:
-            return _model, _train_columns
-        m_path, c_path = MODEL_PATH, COLUMNS_PATH
-    elif model_version == 'khushee':
-        if _model_k is not None:
-            return _model_k, _train_columns_k
-        m_path, c_path = MODEL_PATH_K, COLUMNS_PATH_K
-    else:
-        raise ValueError(f"Unknown model_version '{model_version}'. Use 'manas' or 'khushee'.")
+# Initialize once at module load
+_llm = _init_llm()
 
-    if not os.path.exists(m_path):
-        raise FileNotFoundError(f"Model not found at {m_path}.")
-    if not os.path.exists(c_path):
-        raise FileNotFoundError(f"Columns not found at {c_path}.")
+# ─────────────────────────────────────────────────────────────
+# LAST CONTEXT — exposed so judge.py can retrieve brand context
+# used in the most recent generate_posts() call
+# ─────────────────────────────────────────────────────────────
 
-    with open(m_path, 'rb') as f:
-        loaded_model = pickle.load(f)
-    with open(c_path, 'rb') as f:
-        loaded_columns = pickle.load(f)
+_last_context: str = ""
 
-    if model_version == 'manas':
-        _model, _train_columns = loaded_model, loaded_columns
-    else:
-        _model_k, _train_columns_k = loaded_model, loaded_columns
 
-    print(f"✅ XGBoost model loaded [{model_version}] ({len(loaded_columns)} features)")
-    return loaded_model, loaded_columns
+def get_last_context() -> str:
+    """Returns the brand context used in the last generate_posts() call."""
+    return _last_context
 
 
 # ─────────────────────────────────────────────────────────────
-# PREDICTION
+# RAG MODULE IMPORT
 # ─────────────────────────────────────────────────────────────
 
-def _predict_with_version(features_dict: dict, version: str) -> float:
-    """Internal helper — runs prediction for a specific model version."""
-    model, train_columns = load_model(version)
-    model_features = {
-        'caption_length':      features_dict['caption_length'],
-        'hashtag_count':       features_dict['hashtag_count'],
-        'new_sentiment_score': features_dict['new_sentiment_score'],
-        'has_cta':             features_dict['has_cta'],
-        'platform_encoded':    features_dict['platform_encoded'],
-        'hour_posted':         features_dict['hour_posted']
-    }
-    input_df = pd.DataFrame([model_features])
-    input_df['hour_posted']      = input_df['hour_posted'].astype('category')
-    input_df['platform_encoded'] = input_df['platform_encoded'].astype('category')
-    processed = pd.get_dummies(input_df, columns=['hour_posted', 'platform_encoded'], drop_first=True)
-    processed = processed.reindex(columns=train_columns, fill_value=0)
-    log_pred  = model.predict(processed)[0]
-    return max(0.0, round(float(np.expm1(log_pred)), 4))
-
-
-def predict_engagement(features_dict: dict, model_version: str = 'khushee') -> float:
-    """
-    Predicts engagement score for a post using a pre-trained XGBoost model.
-    Called by optimize_variants() in pipeline.py.
-
-    Args:
-        features_dict (dict): must contain these keys exactly:
-            - caption_length (int)     character count of post
-            - hashtag_count (int)      number of hashtags
-            - new_sentiment_score (float) VADER compound -1 to 1
-            - has_cta (int)            0 or 1
-            - platform_encoded (int)   0=Twitter 1=LinkedIn 2=Instagram
-            - hour_posted (int)        0-23
-        model_version (str): 'auto' (default) — picks whichever model scores higher.
-                             'manas' or 'khushee' to force a specific model.
-
-    Returns:
-        float: predicted engagement score
-               raw number — higher = better
-               typical range: 0 to ~500
-
-    Raises:
-        FileNotFoundError: if model pkl files missing
-    """
-    if model_version == 'auto':
-        score_manas   = _predict_with_version(features_dict, 'manas')
-        score_khushee = _predict_with_version(features_dict, 'khushee')
-        return max(score_manas, score_khushee)
-
-    return _predict_with_version(features_dict, model_version)
-
+try:
+    from modules.rag import (
+        build_index,
+        retrieve_brand_context,
+        is_index_built
+    )
+    RAG_AVAILABLE = True
+except ImportError:
+    try:
+        # Fallback for when running from repo root
+        sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+        from modules.rag import (
+            build_index,
+            retrieve_brand_context,
+            is_index_built
+        )
+        RAG_AVAILABLE = True
+    except ImportError:
+        RAG_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING
+# PREDICTOR MODULE IMPORT
 # ─────────────────────────────────────────────────────────────
 
-def extract_features_from_raw(text: str, platform: str = 'twitter', timestamp=None) -> dict:
-    """
-    Extracts XGBoost model features from raw post text.
-    Use this for examiner demos or when you have plain text (not a variant dict).
+try:
+    from modules.predictor import predict_engagement, score_content_quality
+except ImportError:
+    def predict_engagement(features_dict):
+        raise RuntimeError(
+            "predictor module not found. "
+            "Ensure modules/predictor.py exists."
+        )
+    def score_content_quality(text: str) -> float:
+        return 0.5  # neutral fallback
 
-    For pipeline use, prefer extract_features() in pipeline.py which
-    takes a structured variant dict from generate_posts().
+# ─────────────────────────────────────────────────────────────
+# VADER SENTIMENT (for feature extraction)
+# ─────────────────────────────────────────────────────────────
 
-    Args:
-        text      : raw post string
-        platform  : 'twitter', 'linkedin', or 'instagram'
-        timestamp : datetime-like or None — if provided, hour_posted is extracted
+import ssl
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-    Returns:
-        dict matching MODEL_FEATURES schema:
-            caption_length, hashtag_count, new_sentiment_score,
-            has_cta, platform_encoded, hour_posted
-    """
-    text_lower = text.lower() if text else ''
+# Fix SSL certificate issue on Mac
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+else:
+    ssl._create_default_https_context = _create_unverified_https_context
 
-    caption_length       = len(text) if text else 0
-    hashtag_count        = text.count('#') if text else 0
-    new_sentiment_score  = round(_vader.polarity_scores(text)['compound'], 4) if text else 0.0
-    has_cta              = int(any(kw in text_lower for kw in _CTA_KEYWORDS))
+# Download VADER if needed
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
 
-    platform_map     = {'twitter': 0, 'linkedin': 1, 'instagram': 2}
-    platform_encoded = platform_map.get(platform.lower(), 0)
-
-    if timestamp is not None:
-        try:
-            hour_posted = pd.Timestamp(timestamp).hour
-        except Exception:
-            hour_posted = 9
-    else:
-        hour_posted = 9
-
-    return {
-        'caption_length':      caption_length,
-        'hashtag_count':       hashtag_count,
-        'new_sentiment_score': new_sentiment_score,
-        'has_cta':             has_cta,
-        'platform_encoded':    platform_encoded,
-        'hour_posted':         hour_posted,
-    }
+_vader = SentimentIntensityAnalyzer()
 
 
 # ─────────────────────────────────────────────────────────────
-# POSTING TIME FUNCTIONS
+# FEW-SHOT EXAMPLES LIBRARY
+# Sources: Nike (Twitter), Adobe (LinkedIn), NatGeo (Instagram)
+# Real posts from real brands — not fabricated
 # ─────────────────────────────────────────────────────────────
 
-def get_optimal_posting_hour(features_dict: dict, model_version: str = 'manas') -> tuple:
+_TWITTER_EXAMPLES = """
+EXAMPLE 1 (Athlete/Event Celebration - Nike):
+"When you're this fast, you don't ask for permission. Jutta Leerdam
+breaks the Olympic record in the Speed Skating 1000m and wins her
+first Gold. #MilanoCortina2026 #Olympics"
+
+EXAMPLE 2 (Product Launch - Nike):
+"Mute the gallery. Introducing Nike Powerbeats Pro 2, the ultimate
+fitness earbuds. The first-ever Beats x Nike collab — where premium
+sound meets unbeatable stability. No advice required.
+Launching March 20th at 9am PST."
+
+EXAMPLE 3 (Motivational/Quote - Nike):
+"There's no failure in sports. It's steps to success." - @Giannis_An34
+Regardless of the outcome, there's always a reward ahead. #AlwaysForward
+"""
+
+_LINKEDIN_EXAMPLES = """
+EXAMPLE 1 (Thought Leadership - Adobe):
+"Creative teams are under pressure to deliver more content across more
+channels than ever before. Many are turning to AI to handle production
+tasks like resizing, versioning, and early-stage ideation, so they can
+spend more time refining concepts and craft. Adobe's latest research
+breaks down how this shift is changing the way we do creative work."
+
+EXAMPLE 2 (Corporate Announcement - Adobe):
+"The way brands are discovered is changing fast. Today, Adobe completed
+its acquisition of Semrush, expanding how businesses show up, get found,
+and drive growth in an AI-first world. AI-driven traffic to U.S. retail
+sites is up 269% year over year, yet most businesses still have significant
+gaps in how they appear across AI surfaces."
+
+EXAMPLE 3 (Community/Human Story - Adobe):
+"My greatest inspiration came from being raised by a self-made single
+mom who showed us strength and resilience. From drawing at a young age
+to now utilizing Adobe tools to bridge the gap between art and business,
+Alexandra Yvette continues to create and share her talents with the
+world this Women's History Month."
+"""
+
+_INSTAGRAM_EXAMPLES = """
+EXAMPLE 1 (Wildlife/Action Story - NatGeo):
+"This image was taken near Polán, Toledo province (Spain) last August,
+from a tiny hide-out overlooking a small waterhole where lynxes
+occasionally come down to drink. It was an extremely hot afternoon,
+and a rabbit was very close to the water. Suddenly, a lynx appeared
+silently, but the rabbit noticed it at the very last second.
+Photo by @alexandrovich_yo from our @natgeoyourshot community."
+
+EXAMPLE 2 (Landscape/Philosophical - NatGeo):
+"From Punta Helbronner, 11,370 feet above sea level on the Italian
+side of Mont Blanc in the Alps, my guide walks out across the snow
+toward Dent du Géant, the Giant's Tooth, illuminated only by the
+light of my drone during a long exposure. Photos by @reuben"
+
+EXAMPLE 3 (Milestone/Achievement - NatGeo):
+"Barcelona's Sagrada Família has reached a new milestone. With the
+cross now installed atop its central Jesus tower, the basilica stands
+more than 560 feet (170m) — surpassing Germany's Ulm Minster as the
+world's tallest church. Photographs by Nuria Puentes, National Geographic-España"
+"""
+
+def get_examples(platform: str) -> str:
     """
-    Finds the best hour to post for maximum predicted engagement.
-    Loops through all 24 hours and returns the best one.
-
-    Args:
-        features_dict: same as predict_engagement() WITHOUT hour_posted
-        model_version (str): 'manas' (default) or 'khushee'
-
-    Returns:
-        tuple: (optimal_hour: int, predicted_score: float)
-    """
-    best_score = -1
-    best_hour  = 9  # default 9am
-
-    for hour in range(24):
-        features = features_dict.copy()
-        features['hour_posted'] = hour
-        score = predict_engagement(features, model_version=model_version)
-        if score > best_score:
-            best_score = score
-            best_hour  = hour
-
-    return best_hour, round(best_score, 4)
-
-
-def get_best_posting_time(platform: str) -> str:
-    """
-    Returns human-readable best posting time per platform.
-    Based on Manas's EDA findings from Kaggle Twitter dataset.
-    Used by Aditya's UI for display.
+    Returns few-shot examples for the given platform.
 
     Args:
         platform: "twitter", "linkedin", or "instagram"
 
     Returns:
-        str: e.g. "Tuesday 9:00 AM"
+        str: formatted examples string for prompt injection
     """
-    best_times = {
-        "twitter":   "Wednesday 9:00 AM",
-        "linkedin":  "Tuesday 9:00 AM",
-        "instagram": "Wednesday 11:00 AM"
+    mapping = {
+        "twitter":   _TWITTER_EXAMPLES,
+        "linkedin":  _LINKEDIN_EXAMPLES,
+        "instagram": _INSTAGRAM_EXAMPLES
     }
-    return best_times.get(platform.lower(), "Tuesday 9:00 AM")
+    return mapping.get(platform.lower(), "")
 
 
 # ─────────────────────────────────────────────────────────────
-# FEATURE IMPORTANCE
+# PROMPT TEMPLATES
+# Three levels to demonstrate optimization progression
 # ─────────────────────────────────────────────────────────────
 
-def get_feature_importance(model_version: str = 'manas') -> pd.DataFrame:
+# Level 1 — Zero-shot (baseline, no examples, no COT)
+ZEROSHOT_TEMPLATE = PromptTemplate(
+    input_variables=["brand_name", "topic", "tone", "platform"],
+    template="""
+You are an expert social media content creator.
+
+Generate exactly 5 distinct social media post variants for the brand {brand_name}.
+
+PLATFORM: {platform}
+TOPIC: {topic}
+TONE: {tone}
+
+PLATFORM RULES:
+- Twitter: maximum 280 characters, 2-3 hashtags, punchy and direct
+- LinkedIn: 150-300 words, professional but human, 3-5 hashtags
+- Instagram: storytelling style, 5-10 hashtags, strong opening hook
+
+OUTPUT FORMAT:
+Return exactly 5 posts numbered like this:
+1. [post text] [hashtags]
+2. [post text] [hashtags]
+3. [post text] [hashtags]
+4. [post text] [hashtags]
+5. [post text] [hashtags]
+
+Write only the posts. No explanations.
+"""
+)
+
+# Level 2 — Few-shot (with real brand examples)
+FEWSHOT_TEMPLATE = PromptTemplate(
+    input_variables=["brand_name", "topic", "tone", "platform", "examples"],
+    template="""
+You are an expert social media content creator.
+
+Generate exactly 5 distinct social media post variants for the brand {brand_name}.
+
+PLATFORM: {platform}
+TOPIC: {topic}
+TONE: {tone}
+
+PLATFORM RULES:
+- Twitter: maximum 280 characters, 2-3 hashtags, punchy and direct
+- LinkedIn: 150-300 words, professional but human, 3-5 hashtags
+- Instagram: storytelling style, 5-10 hashtags, strong opening hook
+
+HIGH PERFORMING EXAMPLES FOR REFERENCE:
+{examples}
+
+Now write 5 posts matching the same quality and style as the examples above.
+
+OUTPUT FORMAT:
+Return exactly 5 posts numbered like this:
+1. [post text] [hashtags]
+2. [post text] [hashtags]
+3. [post text] [hashtags]
+4. [post text] [hashtags]
+5. [post text] [hashtags]
+
+Write only the posts. No explanations.
+"""
+)
+
+# Level 3 — Unified (few-shot + COT + JSON) — PRODUCTION TEMPLATE
+UNIFIED_TEMPLATE = PromptTemplate(
+    input_variables=["brand_name", "topic", "tone", "platform",
+                     "examples", "brand_context"],
+    template="""
+You are an expert social media content creator specializing in brand voice alignment.
+
+Generate exactly 5 distinct social media post variants for the brand {brand_name}.
+
+PLATFORM: {platform}
+TOPIC: {topic}
+TONE: {tone}
+
+BRAND GUIDELINES FOR {brand_name}:
+{brand_context}
+
+PLATFORM RULES:
+- Twitter: maximum 280 characters, 2-3 hashtags, punchy and direct
+- LinkedIn: 150-300 words, professional but human, 3-5 hashtags, short paragraphs
+- Instagram: storytelling style, strong opening hook, 5-10 hashtags, emojis throughout
+
+HIGH PERFORMING EXAMPLES FOR REFERENCE:
+{examples}
+
+THINK STEP BY STEP BEFORE WRITING EACH VARIANT:
+Step 1 - Audience: Who is the primary audience for this variant?
+Step 2 - Key Message: What is the single most important message?
+Step 3 - Tone Check: Does the tone match the brand and platform?
+Step 4 - Hook: What opening line will stop the scroll?
+Step 5 - CTA: What action should the reader take?
+
+Make each variant structurally distinct:
+- Variant 1: Lead with business impact
+- Variant 2: Lead with customer benefit
+- Variant 3: Lead with a bold statement or question
+- Variant 4: Lead with data or proof points
+- Variant 5: Lead with a human or emotional angle
+
+IMPORTANT: Respond with ONLY a valid JSON array.
+No explanations. No preamble. No markdown. Just the JSON.
+
+Return exactly this structure:
+[
+  {{
+    "variant_id": 1,
+    "reasoning": "brief explanation of thinking for this variant",
+    "post_text": "the post content here",
+    "hashtags": ["#hashtag1", "#hashtag2"],
+    "tone": "describe the tone used",
+    "suggested_posting_time": "best day and time to post",
+    "platform": "{platform}"
+  }},
+  {{
+    "variant_id": 2,
+    "reasoning": "brief explanation of thinking for this variant",
+    "post_text": "the post content here",
+    "hashtags": ["#hashtag1", "#hashtag2"],
+    "tone": "describe the tone used",
+    "suggested_posting_time": "best day and time to post",
+    "platform": "{platform}"
+  }},
+  {{
+    "variant_id": 3,
+    "reasoning": "brief explanation of thinking for this variant",
+    "post_text": "the post content here",
+    "hashtags": ["#hashtag1", "#hashtag2"],
+    "tone": "describe the tone used",
+    "suggested_posting_time": "best day and time to post",
+    "platform": "{platform}"
+  }},
+  {{
+    "variant_id": 4,
+    "reasoning": "brief explanation of thinking for this variant",
+    "post_text": "the post content here",
+    "hashtags": ["#hashtag1", "#hashtag2"],
+    "tone": "describe the tone used",
+    "suggested_posting_time": "best day and time to post",
+    "platform": "{platform}"
+  }},
+  {{
+    "variant_id": 5,
+    "reasoning": "brief explanation of thinking for this variant",
+    "post_text": "the post content here",
+    "hashtags": ["#hashtag1", "#hashtag2"],
+    "tone": "describe the tone used",
+    "suggested_posting_time": "best day and time to post",
+    "platform": "{platform}"
+  }}
+]
+"""
+)
+
+
+# ─────────────────────────────────────────────────────────────
+# JSON PARSER
+# ─────────────────────────────────────────────────────────────
+
+def _parse_json_response(response_text: str) -> list:
     """
-    Returns feature importance from trained model.
-    Used by Aditya's UI to explain why a post scored well.
+    Cleans and parses Claude's JSON response.
+    Handles markdown code blocks if present.
+    """
+    text = response_text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON parsing failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# FEATURE EXTRACTION
+# ─────────────────────────────────────────────────────────────
+
+def _get_vader_score(text: str) -> float:
+    """
+    VADER sentiment score — used for XGBoost feature.
+    Named new_sentiment_score to match Manas's model schema.
+    Returns compound score from -1 to 1.
+    NOTE: Uses VADER not DistilBERT because Manas trained
+    XGBoost on VADER scores — must match training distribution.
+    """
+    return round(_vader.polarity_scores(text)['compound'], 4)
+
+
+def extract_features(variant: dict, platform: str) -> dict:
+    """
+    Extracts content features matching Manas's XGBoost schema exactly.
 
     Args:
-        model_version (str): 'manas' (default) or 'khushee'
+        variant: single post dict from generate_posts()
+        platform: "twitter", "linkedin", or "instagram"
 
     Returns:
-        DataFrame with columns: Feature, Importance
-        Sorted by importance descending
+        dict with keys matching Manas's model training features
     """
-    model, train_columns = load_model(model_version)
+    post_text = variant['post_text']
+    hashtags  = variant['hashtags']
+    posting_time = variant.get('suggested_posting_time', '9:00 AM')
 
-    return pd.DataFrame({
-        'Feature':    train_columns,
-        'Importance': model.feature_importances_
-    }).sort_values(by='Importance', ascending=False).reset_index(drop=True)
+    # Caption length
+    caption_length = len(post_text)
 
+    # Hashtag count
+    hashtag_count = len(hashtags)
 
-# ─────────────────────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────────────────────
+    # VADER sentiment — named new_sentiment_score to match Manas
+    new_sentiment_score = _get_vader_score(post_text)
 
-if __name__ == "__main__":
-    print("Testing predictor.py...\n")
+    # Has CTA — matches Manas's training CTA keywords
+    cta_keywords = [
+        'link', 'register', 'learn more', 'sign up', 'click here',
+        'visit', 'download', 'bio', 'get started', 'click',
+        'discover', 'explore', 'try', 'get', 'join', 'shop',
+        'buy', 'check out', 'read', 'watch', 'follow', 'share'
+    ]
+    has_cta = int(any(kw in post_text.lower() for kw in cta_keywords))
 
-    test_features = {
-        'caption_length':      280,
-        'hashtag_count':       3,
-        'new_sentiment_score': 0.75,
-        'has_cta':             1,
-        'platform_encoded':    1,   # LinkedIn
-        'hour_posted':         9
+    # Platform encoded — named platform_encoded to match Manas
+    platform_map = {"twitter": 0, "linkedin": 1, "instagram": 2}
+    platform_encoded = platform_map.get(platform.lower(), 0)
+
+    # Hour posted — required by Manas's model
+    # Extracted from suggested_posting_time field
+    hour_match = re.search(r'(\d+):\d+\s*(AM|PM)', posting_time)
+    if hour_match:
+        hour = int(hour_match.group(1))
+        if hour_match.group(2) == 'PM' and hour != 12:
+            hour += 12
+        elif hour_match.group(2) == 'AM' and hour == 12:
+            hour = 0
+    else:
+        hour = 9  # default 9am
+
+    # Additional features for display / future model use
+    word_count   = len(post_text.split())
+    has_question = int('?' in post_text)
+    emoji_pattern = re.compile(
+        "[" u"\U0001F600-\U0001F64F"
+        u"\U0001F300-\U0001F5FF"
+        u"\U0001F680-\U0001F9FF"
+        u"\U00002700-\U000027BF" "]+",
+        flags=re.UNICODE
+    )
+    has_emoji = int(bool(emoji_pattern.search(post_text)))
+
+    return {
+        # Core features — match Manas's model exactly
+        "caption_length":      caption_length,
+        "hashtag_count":       hashtag_count,
+        "new_sentiment_score": new_sentiment_score,
+        "has_cta":             has_cta,
+        "platform_encoded":    platform_encoded,
+        "hour_posted":         hour,
+        # Additional features
+        "word_count":          word_count,
+        "has_question":        has_question,
+        "has_emoji":           has_emoji
     }
 
-    score = predict_engagement(test_features)
-    print(f"Test prediction: {score}")
 
-    best_hour, best_score = get_optimal_posting_hour({
-        k: v for k, v in test_features.items()
-        if k != 'hour_posted'
-    })
-    print(f"Optimal hour: {best_hour}:00 (score: {best_score})")
-    print(f"Best time (LinkedIn): {get_best_posting_time('linkedin')}")
+# ─────────────────────────────────────────────────────────────
+# MAIN PIPELINE FUNCTIONS
+# ─────────────────────────────────────────────────────────────
 
-    importance = get_feature_importance()
-    print(f"\nTop 5 features:")
-    print(importance.head())
+def generate_posts(
+    brand_name: str,
+    topic: str,
+    tone: str,
+    platform: str,
+    pdf_path: str = None,
+    brand_context: str = None,
+    model: str = None
+) -> list:
+    """
+    Generates 5 social media post variants using the unified
+    template (few-shot + chain-of-thought + JSON + RAG).
+
+    Args:
+        brand_name (str):    e.g. "Adobe"
+        topic (str):         e.g. "Adobe's acquisition of Semrush"
+        tone (str):          e.g. "professional, forward looking"
+        platform (str):      "twitter", "linkedin", or "instagram"
+        pdf_path (str):      optional path to brand voice PDF
+        brand_context (str): optional pre-retrieved brand context string
+        model (str):         optional Claude model override
+
+    Returns:
+        list: 5 structured post variants, each containing:
+            - variant_id
+            - reasoning
+            - post_text
+            - hashtags
+            - tone
+            - suggested_posting_time
+            - platform
+    """
+    global _llm, _last_context
+
+    # Swap model if requested
+    if model:
+        _llm = _init_llm(model)
+
+    examples = get_examples(platform)
+
+    # ── Step 1: Get brand context ──
+    if brand_context:
+        context = brand_context
+
+    elif pdf_path and RAG_AVAILABLE:
+        if not is_index_built(brand_name):
+            build_index(pdf_path, brand_name)
+        else:
+            print(f"✅ Using existing RAG index for {brand_name}")
+
+        context = retrieve_brand_context(
+            brand_name=brand_name,
+            topic=topic,
+            platform=platform,
+            tone=tone
+        )
+        print(f"✅ Retrieved brand context ({len(context)} chars)")
+
+    else:
+        context = (
+            f"Write in a {tone} tone appropriate "
+            f"for {brand_name} on {platform}."
+        )
+
+    _last_context = context
+
+    # ── Step 2: Assemble prompt ──
+    filled_prompt = UNIFIED_TEMPLATE.format(
+        brand_name=brand_name,
+        topic=topic,
+        tone=tone,
+        platform=platform,
+        examples=examples,
+        brand_context=context
+    )
+
+    # ── Step 3: Call Claude ──
+    response = _llm.invoke([HumanMessage(content=filled_prompt)])
+
+    # ── Step 4: Parse and return ──
+    return _parse_json_response(response.content)
+
+
+def optimize_variants(variants: list, platform: str) -> tuple:
+    """
+    Scores and ranks 5 post variants using hybrid engagement scoring.
+
+    Hybrid Score = 0.5 × XGBoost (structural features) + 0.5 × DistilBERT (content quality)
+    Final scores are later re-weighted to 0.25 each via rerank_with_judge().
+    XGBoost model: Manas Sandeep Rane
+    DistilBERT model: Khushee Paprunia (abhinav192/distilbert-engagement)
+
+    If scoring fails — returns posts unranked with scoring_failed=True.
+
+    Args:
+        variants: list of 5 post dicts from generate_posts()
+        platform: "twitter", "linkedin", or "instagram"
+
+    Returns:
+        ranked_variants: list sorted best first (or original order)
+        scores:          list of hybrid scores (or empty list)
+        scoring_failed:  bool — True if scoring unavailable
+    """
+    scores = []
+
+    try:
+        print("Extracting features and scoring variants (XGBoost + DistilBERT hybrid)...")
+
+        # Collect raw XGBoost scores first for normalisation
+        xgb_raw = []
+        for variant in variants:
+            features = extract_features(variant, platform)
+            variant['features'] = features
+            xgb_raw.append(predict_engagement(features))
+
+        xgb_min   = min(xgb_raw)
+        xgb_max   = max(xgb_raw)
+        xgb_range = (xgb_max - xgb_min) if xgb_max != xgb_min else 1.0
+
+        for i, variant in enumerate(variants):
+            post_text = variant.get('post_text', '')
+
+            # XGBoost structural score — normalised to 0-1
+            xgb_norm = (xgb_raw[i] - xgb_min) / xgb_range
+
+            # DistilBERT content quality score — already 0-1
+            bert_score = score_content_quality(post_text)
+
+            # Hybrid: equal weight
+            hybrid = round(0.5 * xgb_norm + 0.5 * bert_score, 4)
+
+            scores.append(hybrid)
+            variant['predicted_score'] = hybrid
+            variant['xgb_score']       = round(xgb_raw[i], 4)
+            variant['bert_score']      = bert_score
+            variant['is_recommended']  = False
+            variant['scoring_failed']  = False
+            print(
+                f"  Variant {i+1}: xgb={xgb_raw[i]:.2f} "
+                f"bert={bert_score:.4f} hybrid={hybrid:.4f}"
+            )
+
+        # Sort descending by hybrid score
+        ranked = sorted(
+            variants,
+            key=lambda x: x['predicted_score'],
+            reverse=True
+        )
+        ranked[0]['is_recommended'] = True
+
+        print(
+            f"\n⭐ Recommended: Variant {ranked[0]['variant_id']} "
+            f"(hybrid score: {ranked[0]['predicted_score']})"
+        )
+        return ranked, scores, False
+
+    except Exception as e:
+        print(f"\n⚠️ Scoring unavailable: {e}")
+        print("   Returning all posts unscored.")
+        print("   You can still read and select the post you prefer.")
+
+        for variant in variants:
+            variant['predicted_score'] = None
+            variant['is_recommended']  = False
+            variant['scoring_failed']  = True
+
+        return variants, [], True
+
+
+# ─────────────────────────────────────────────────────────────
+# HYBRID RE-RANKING WITH JUDGE SCORES (Khushee Paprunia)
+# Called after judge_variants() has added faithfulness/relevance.
+# Final score = 0.25 × XGBoost + 0.25 × DistilBERT
+#             + 0.25 × faithfulness/10 + 0.25 × relevance/10
+# ─────────────────────────────────────────────────────────────
+
+def rerank_with_judge(variants: list) -> list:
+    """
+    Re-ranks variants using a 4-way equal hybrid score:
+      0.25 × XGBoost (normalised) + 0.25 × DistilBERT
+    + 0.25 × judge_faithfulness/10 + 0.25 × judge_relevance/10
+
+    Must be called AFTER judge_variants() has run so that
+    judge_faithfulness and judge_relevance are present.
+    Author: Khushee Paprunia
+
+    Args:
+        variants: list of variant dicts with xgb_score, bert_score,
+                  judge_faithfulness, judge_relevance already set
+
+    Returns:
+        re-ranked variants list (best first), is_recommended updated
+    """
+    # Normalise XGBoost scores across this batch
+    xgb_vals  = [v.get('xgb_score', 0) or 0 for v in variants]
+    xgb_min   = min(xgb_vals)
+    xgb_max   = max(xgb_vals)
+    xgb_range = (xgb_max - xgb_min) if xgb_max != xgb_min else 1.0
+
+    for variant in variants:
+        xgb_norm   = (variant.get('xgb_score', 0) - xgb_min) / xgb_range
+        bert       = variant.get('bert_score', 0.5) or 0.5
+        faithfulness = (variant.get('judge_faithfulness') or 5) / 10.0
+        relevance    = (variant.get('judge_relevance')    or 5) / 10.0
+
+        final = round(
+            0.25 * xgb_norm +
+            0.25 * bert     +
+            0.25 * faithfulness +
+            0.25 * relevance,
+            4
+        )
+        variant['predicted_score'] = final
+        variant['is_recommended']  = False
+        print(
+            f"  Variant {variant.get('variant_id','?')}: "
+            f"xgb_n={xgb_norm:.3f} bert={bert:.3f} "
+            f"faith={faithfulness:.2f} rel={relevance:.2f} "
+            f"→ final={final:.4f}"
+        )
+
+    ranked = sorted(variants, key=lambda x: x['predicted_score'], reverse=True)
+    ranked[0]['is_recommended'] = True
+    print(f"\n⭐ Final recommended: Variant {ranked[0].get('variant_id','?')} "
+          f"(score: {ranked[0]['predicted_score']})")
+    return ranked
+
+
+# ─────────────────────────────────────────────────────────────
+# IMAGE GENERATION (Khushee Paprunia)
+# Generates brand-aware images for post variants via gpt-image-1.
+# Brand context from RAG is used first; falls back to brand name.
+# ─────────────────────────────────────────────────────────────
+
+def _caption_to_image_prompt(caption: str, platform: str, tone: str,
+                              brand_name: str = '', brand_context: str = '') -> str:
+    """
+    Converts a post caption into an image generation prompt using Claude.
+    Incorporates brand guidelines if available.
+    Author: Khushee Paprunia
+    """
+    platform_style = {
+        'twitter':   'clean, minimal, bold typography, simple background',
+        'linkedin':  'professional, corporate, modern office aesthetic, clean blue tones',
+        'instagram': 'vibrant, visually striking, lifestyle, warm colors, high contrast'
+    }
+    style = platform_style.get(platform.lower(), 'clean, modern, professional')
+
+    if brand_context and len(brand_context.strip()) > 20:
+        brand_info = f"Brand guidelines:\n{brand_context[:500]}"
+    elif brand_name:
+        brand_info = f"Brand: {brand_name}"
+    else:
+        brand_info = ''
+
+    prompt_text = (
+        f"Convert this social media post caption into an image generation prompt.\n\n"
+        f"Platform: {platform} ({style})\n"
+        f"Tone: {tone}\n"
+        f"{brand_info}\n\n"
+        f"Caption:\n{caption}\n\n"
+        f"Rules:\n"
+        f"- Describe a photorealistic scene that matches the brand and caption\n"
+        f"- Include brand name or product in the scene if relevant\n"
+        f"- Specify lighting, composition, and mood\n"
+        f"- Keep it under 200 words\n"
+        f"- Return ONLY the image prompt — no explanations, no preamble\n"
+    )
+
+    try:
+        response = _llm.invoke([HumanMessage(content=prompt_text)])
+        raw = response.content.strip()
+        # Strip any markdown headings or preamble Claude occasionally adds
+        lines = raw.splitlines()
+        cleaned = [l for l in lines if not l.startswith('#') and not l.lower().startswith('image generation prompt')]
+        return '\n'.join(cleaned).strip()
+    except Exception:
+        # Fallback: simple keyword prompt
+        words = caption.replace('#', '').replace('@', '').split()[:8]
+        return f"{brand_name} {' '.join(words)} {style}, photorealistic".strip()
+
+
+def generate_image(caption: str, platform: str, tone: str = 'professional',
+                   brand_name: str = '', brand_context: str = '') -> dict:
+    """
+    Generates a brand-aware image for a post using gpt-image-1.
+    Author: Khushee Paprunia
+
+    Args:
+        caption      : post text to generate image for
+        platform     : 'twitter', 'linkedin', or 'instagram'
+        tone         : post tone (used for style guidance)
+        brand_name   : brand name fallback if no RAG context
+        brand_context: RAG-retrieved brand guidelines (preferred)
+
+    Returns:
+        dict with keys:
+            image_url   : data URI (base64) or URL string, or None on failure
+            image_prompt: prompt sent to the model
+            success     : bool
+    """
+    try:
+        from openai import OpenAI as _OpenAI
+        _load_api_keys()
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if not openai_key:
+            raise EnvironmentError("OPENAI_API_KEY not found in .env")
+        client = _OpenAI(api_key=openai_key)
+
+        # Build brand-aware image prompt via Claude
+        image_prompt = _caption_to_image_prompt(
+            caption, platform, tone, brand_name, brand_context
+        )
+        print(f"  Image prompt: {image_prompt[:80]}...")
+
+        response = client.images.generate(
+            model="gpt-image-1",
+            prompt=image_prompt,
+            size="1024x1024",
+            n=1
+        )
+
+        image_data = response.data[0]
+        if hasattr(image_data, 'url') and image_data.url:
+            final_url = image_data.url
+        else:
+            b64 = image_data.b64_json
+            final_url = f"data:image/png;base64,{b64}"
+
+        print(f"  Image generated ✅")
+        return {'image_url': final_url, 'image_prompt': image_prompt, 'success': True}
+
+    except Exception as e:
+        print(f"  ⚠️ Image generation failed: {e}")
+        return {'image_url': None, 'image_prompt': None, 'success': False}
+
+
+def generate_images_for_variants(variants: list, platform: str,
+                                  top_n: int = 1, brand_name: str = '',
+                                  brand_context: str = '') -> list:
+    """
+    Generates images for the top N ranked post variants.
+    Author: Khushee Paprunia
+
+    Args:
+        variants     : ranked list of post variants from optimize_variants()
+        platform     : 'twitter', 'linkedin', or 'instagram'
+        top_n        : number of variants to generate images for (default 1)
+        brand_name   : brand name for image prompt
+        brand_context: RAG brand guidelines for image prompt
+
+    Returns:
+        variants list with image_url, image_prompt, image_success added
+    """
+    print(f"\nGenerating images for top {top_n} variant(s)...")
+    for i, variant in enumerate(variants):
+        if i < top_n:
+            caption = variant.get('post_text', '')
+            tone    = variant.get('tone', 'professional')
+            result  = generate_image(caption, platform, tone, brand_name, brand_context)
+            variant['image_url']     = result['image_url']
+            variant['image_prompt']  = result['image_prompt']
+            variant['image_success'] = result['success']
+        else:
+            variant['image_url']     = None
+            variant['image_prompt']  = None
+            variant['image_success'] = False
+    return variants
