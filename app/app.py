@@ -96,6 +96,19 @@ if 'generated_posts' not in st.session_state:
 if 'selected_post' not in st.session_state:
     st.session_state.selected_post = None
 
+def _add_display_scores(variants):
+    """Normalize raw XGBoost scores to a 0-100 engagement index."""
+    raw = [v.get('predicted_score') or 0 for v in variants]
+    lo, hi = min(raw), max(raw)
+    for v in variants:
+        r = v.get('predicted_score') or 0
+        if hi > lo:
+            v['display_score'] = round(50 + (r - lo) / (hi - lo) * 45)
+        else:
+            v['display_score'] = 70
+    return variants
+
+
 def run_pipeline(brand, topic, platform, tone, pdf_path=None):
     """
     Calls real Claude pipeline to generate 5 post variants.
@@ -121,7 +134,8 @@ def run_pipeline(brand, topic, platform, tone, pdf_path=None):
         platform.lower()
     )
 
-    # Add scoring_failed flag to each variant
+    # Add scoring_failed flag and normalized display score to each variant
+    _add_display_scores(ranked)
     for v in ranked:
         v['scoring_failed'] = scoring_failed
 
@@ -319,19 +333,19 @@ def screen_output():
     
     # Display variants
     for idx, variant in enumerate(posts_data['variants'], 1):
-        score = variant.get('predicted_score', 0) or 0
-        all_scores = [v.get('predicted_score', 0) or 0 for v in posts_data['variants']]
-        score_class = get_score_class(score, all_scores)
-        
+        display_score = variant.get('display_score', 0) or 0
+        all_display_scores = [v.get('display_score', 0) or 0 for v in posts_data['variants']]
+        score_class = get_score_class(display_score, all_display_scores)
+
         with st.container():
             # Header row with variant number and score
             col_h1, col_h2 = st.columns([3, 1])
-            
+
             with col_h1:
                 st.markdown(f"#### Variant {idx}")
             with col_h2:
                 recommended = "⭐ " if variant.get('is_recommended') else ""
-                st.markdown(f'<span class="score-badge {score_class}">{recommended}Score: {score:,.0f}</span>', unsafe_allow_html=True)
+                st.markdown(f'<span class="score-badge {score_class}">{recommended}Score: {display_score}/100</span>', unsafe_allow_html=True)
             
             # Content
             st.markdown("**Content:**")
@@ -396,14 +410,14 @@ def screen_metrics():
     # Score and overview
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     
-    score = post_data.get('predicted_score', 0) or 0
+    display_score = post_data.get('display_score', 0) or 0
     features = post_data.get('features', {})
     scoring_failed = post_data.get('scoring_failed', False)
 
     platform = posts_context['platform'].lower()
 
     with col_s1:
-        st.metric("Predicted Engagement", f"{score:,.0f}" if score else "N/A")
+        st.metric("Engagement Index", f"{display_score}/100" if display_score else "N/A")
     with col_s2:
         st.metric("Sentiment Score",
                   f"{features.get('new_sentiment_score', 0):.2f}",
@@ -442,18 +456,18 @@ def screen_metrics():
         st.markdown("### Variant Score Comparison")
         all_variants = posts_context['variants']
         var_labels = [f"Variant {i+1}" for i in range(len(all_variants))]
-        var_scores = [v.get('predicted_score', 0) or 0 for v in all_variants]
+        var_scores = [v.get('display_score', 0) or 0 for v in all_variants]
         colors = ['#1E40AF' if v.get('is_recommended') else '#93C5FD'
                   for v in all_variants]
         fig_bar = go.Figure(go.Bar(
             x=var_labels,
             y=var_scores,
             marker_color=colors,
-            text=[f"{s:,.0f}" for s in var_scores],
+            text=[f"{s}/100" for s in var_scores],
             textposition='outside'
         ))
         fig_bar.update_layout(
-            yaxis_title="Predicted Engagement",
+            yaxis_title="Engagement Index (0-100)",
             height=350,
             showlegend=False,
             margin=dict(t=20, b=0, l=0, r=0)

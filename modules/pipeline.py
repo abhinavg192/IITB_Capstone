@@ -603,11 +603,9 @@ def optimize_variants(variants: list, platform: str) -> tuple:
 
         for i, variant in enumerate(variants):
             features = extract_features(variant, platform)
-
             # Fix hour to neutral — posting time is a recommendation,
             # not a content quality signal
-            features['hour_posted'] = 9
-
+            #features['hour_posted'] = 9
             score = predict_engagement(features)
             scores.append(score)
             variant['predicted_score'] = score
