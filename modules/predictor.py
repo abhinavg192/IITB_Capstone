@@ -5,10 +5,10 @@ Loads Manas's pre-trained model and provides predict_engagement() wrapper.
 
 Usage:
     from modules.predictor import predict_engagement
+    from modules.predictor import extract_features_from_raw
     from modules.predictor import get_optimal_posting_hour
     from modules.predictor import get_best_posting_time
     from modules.predictor import get_feature_importance
-    from modules.predictor import extract_features_from_raw
 
 Author: Manas Sandeep Rane (modularized by Abhinav Gupta)
 """
