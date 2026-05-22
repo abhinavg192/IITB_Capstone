@@ -1,5 +1,3 @@
-$ cat /Users/khusheepaprunia/Desktop/IITB_Capstone/modules/predictor.py
-
 """
 modules/predictor.py
 XGBoost Engagement Predictor
