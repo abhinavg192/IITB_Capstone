@@ -24,7 +24,7 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from modules.predictor import predict_engagement
-from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features
+from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features, generate_images_for_variants, rerank_with_judge
 from modules.rag import build_index, retrieve_brand_context, is_index_built
 from modules.judge import judge_variants, judge
 
@@ -152,6 +152,26 @@ def run_pipeline(brand, topic, platform, tone, pdf_path=None):
         judge_variants(ranked, brand_context, judge_question)
     except Exception as e:
         print(f"⚠️ Judge step skipped: {e}")
+
+    # Re-rank using 4-way equal hybrid: XGBoost + DistilBERT + faithfulness + relevance
+    try:
+        print("\nRe-ranking with judge scores (4-way equal hybrid)...")
+        ranked = rerank_with_judge(ranked)
+    except Exception as e:
+        print(f"⚠️ Re-ranking skipped: {e}")
+
+    # Generate images for all 5 variants (Khushee Paprunia)
+    try:
+        b_context = brand_context or ''
+        ranked = generate_images_for_variants(
+            ranked,
+            platform.lower(),
+            top_n=5,
+            brand_name=brand,
+            brand_context=b_context
+        )
+    except Exception as e:
+        print(f"⚠️ Image generation skipped: {e}")
 
     return ranked
 
@@ -397,6 +417,17 @@ def screen_output():
                     if explanation and explanation != "judge unavailable":
                         st.caption(f"💬 _{explanation}_")
             
+            # Generated image (Khushee Paprunia)
+            if variant.get('image_url'):
+                st.markdown("**Generated Image:**")
+                st.markdown(
+                    f'<img src="{variant["image_url"]}" style="width:100%;border-radius:8px;margin-top:8px;">',
+                    unsafe_allow_html=True
+                )
+                if variant.get('image_prompt'):
+                    with st.expander("🎨 View image prompt"):
+                        st.caption(variant['image_prompt'])
+
             # Action buttons — Edit | Regenerate | Analytics on one row, Copy below
             col_b1, col_b2, col_b3 = st.columns(3)
             with col_b1:
