@@ -112,13 +112,15 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────
 
 try:
-    from modules.predictor import predict_engagement
+    from modules.predictor import predict_engagement, score_content_quality
 except ImportError:
     def predict_engagement(features_dict):
         raise RuntimeError(
             "predictor module not found. "
             "Ensure modules/predictor.py exists."
         )
+    def score_content_quality(text: str) -> float:
+        return 0.5  # neutral fallback
 
 # ─────────────────────────────────────────────────────────────
 # VADER SENTIMENT (for feature extraction)
@@ -593,14 +595,14 @@ def generate_posts(
 
 def optimize_variants(variants: list, platform: str) -> tuple:
     """
-    Scores and ranks 5 post variants by predicted engagement.
+    Scores and ranks 5 post variants using hybrid engagement scoring.
 
-    Uses Manas's XGBoost model via predict_engagement().
-    All variants scored at neutral hour=9am so posting time
-    does not influence content quality ranking.
+    Hybrid Score = 0.5 × XGBoost (structural features) + 0.5 × DistilBERT (content quality)
+    Final scores are later re-weighted to 0.25 each via rerank_with_judge().
+    XGBoost model: Manas Sandeep Rane
+    DistilBERT model: Khushee Paprunia (abhinav192/distilbert-engagement)
 
     If scoring fails — returns posts unranked with scoring_failed=True.
-    Users can still read and select the post they prefer.
 
     Args:
         variants: list of 5 post dicts from generate_posts()
@@ -608,28 +610,49 @@ def optimize_variants(variants: list, platform: str) -> tuple:
 
     Returns:
         ranked_variants: list sorted best first (or original order)
-        scores:          list of raw scores (or empty list)
+        scores:          list of hybrid scores (or empty list)
         scoring_failed:  bool — True if scoring unavailable
     """
     scores = []
 
     try:
-        print("Extracting features and scoring variants...")
+        print("Extracting features and scoring variants (XGBoost + DistilBERT hybrid)...")
 
-        for i, variant in enumerate(variants):
+        # Collect raw XGBoost scores first for normalisation
+        xgb_raw = []
+        for variant in variants:
             features = extract_features(variant, platform)
             variant['features'] = features
-            # Fix hour to neutral — posting time is a recommendation,
-            # not a content quality signal
-            #features['hour_posted'] = 9
-            score = predict_engagement(features)
-            scores.append(score)
-            variant['predicted_score'] = score
+            xgb_raw.append(predict_engagement(features))
+
+        xgb_min   = min(xgb_raw)
+        xgb_max   = max(xgb_raw)
+        xgb_range = (xgb_max - xgb_min) if xgb_max != xgb_min else 1.0
+
+        for i, variant in enumerate(variants):
+            post_text = variant.get('post_text', '')
+
+            # XGBoost structural score — normalised to 0-1
+            xgb_norm = (xgb_raw[i] - xgb_min) / xgb_range
+
+            # DistilBERT content quality score — already 0-1
+            bert_score = score_content_quality(post_text)
+
+            # Hybrid: equal weight
+            hybrid = round(0.5 * xgb_norm + 0.5 * bert_score, 4)
+
+            scores.append(hybrid)
+            variant['predicted_score'] = hybrid
+            variant['xgb_score']       = round(xgb_raw[i], 4)
+            variant['bert_score']      = bert_score
             variant['is_recommended']  = False
             variant['scoring_failed']  = False
-            print(f"  Variant {i+1}: score = {score}")
+            print(
+                f"  Variant {i+1}: xgb={xgb_raw[i]:.2f} "
+                f"bert={bert_score:.4f} hybrid={hybrid:.4f}"
+            )
 
-        # Sort descending
+        # Sort descending by hybrid score
         ranked = sorted(
             variants,
             key=lambda x: x['predicted_score'],
@@ -639,7 +662,7 @@ def optimize_variants(variants: list, platform: str) -> tuple:
 
         print(
             f"\n⭐ Recommended: Variant {ranked[0]['variant_id']} "
-            f"(score: {ranked[0]['predicted_score']})"
+            f"(hybrid score: {ranked[0]['predicted_score']})"
         )
         return ranked, scores, False
 
@@ -654,3 +677,204 @@ def optimize_variants(variants: list, platform: str) -> tuple:
             variant['scoring_failed']  = True
 
         return variants, [], True
+
+
+# ─────────────────────────────────────────────────────────────
+# HYBRID RE-RANKING WITH JUDGE SCORES (Khushee Paprunia)
+# Called after judge_variants() has added faithfulness/relevance.
+# Final score = 0.25 × XGBoost + 0.25 × DistilBERT
+#             + 0.25 × faithfulness/10 + 0.25 × relevance/10
+# ─────────────────────────────────────────────────────────────
+
+def rerank_with_judge(variants: list) -> list:
+    """
+    Re-ranks variants using a 4-way equal hybrid score:
+      0.25 × XGBoost (normalised) + 0.25 × DistilBERT
+    + 0.25 × judge_faithfulness/10 + 0.25 × judge_relevance/10
+
+    Must be called AFTER judge_variants() has run so that
+    judge_faithfulness and judge_relevance are present.
+    Author: Khushee Paprunia
+
+    Args:
+        variants: list of variant dicts with xgb_score, bert_score,
+                  judge_faithfulness, judge_relevance already set
+
+    Returns:
+        re-ranked variants list (best first), is_recommended updated
+    """
+    # Normalise XGBoost scores across this batch
+    xgb_vals  = [v.get('xgb_score', 0) or 0 for v in variants]
+    xgb_min   = min(xgb_vals)
+    xgb_max   = max(xgb_vals)
+    xgb_range = (xgb_max - xgb_min) if xgb_max != xgb_min else 1.0
+
+    for variant in variants:
+        xgb_norm   = (variant.get('xgb_score', 0) - xgb_min) / xgb_range
+        bert       = variant.get('bert_score', 0.5) or 0.5
+        faithfulness = (variant.get('judge_faithfulness') or 5) / 10.0
+        relevance    = (variant.get('judge_relevance')    or 5) / 10.0
+
+        final = round(
+            0.25 * xgb_norm +
+            0.25 * bert     +
+            0.25 * faithfulness +
+            0.25 * relevance,
+            4
+        )
+        variant['predicted_score'] = final
+        variant['is_recommended']  = False
+        print(
+            f"  Variant {variant.get('variant_id','?')}: "
+            f"xgb_n={xgb_norm:.3f} bert={bert:.3f} "
+            f"faith={faithfulness:.2f} rel={relevance:.2f} "
+            f"→ final={final:.4f}"
+        )
+
+    ranked = sorted(variants, key=lambda x: x['predicted_score'], reverse=True)
+    ranked[0]['is_recommended'] = True
+    print(f"\n⭐ Final recommended: Variant {ranked[0].get('variant_id','?')} "
+          f"(score: {ranked[0]['predicted_score']})")
+    return ranked
+
+
+# ─────────────────────────────────────────────────────────────
+# IMAGE GENERATION (Khushee Paprunia)
+# Generates brand-aware images for post variants via gpt-image-1.
+# Brand context from RAG is used first; falls back to brand name.
+# ─────────────────────────────────────────────────────────────
+
+def _caption_to_image_prompt(caption: str, platform: str, tone: str,
+                              brand_name: str = '', brand_context: str = '') -> str:
+    """
+    Converts a post caption into an image generation prompt using Claude.
+    Incorporates brand guidelines if available.
+    Author: Khushee Paprunia
+    """
+    platform_style = {
+        'twitter':   'clean, minimal, bold typography, simple background',
+        'linkedin':  'professional, corporate, modern office aesthetic, clean blue tones',
+        'instagram': 'vibrant, visually striking, lifestyle, warm colors, high contrast'
+    }
+    style = platform_style.get(platform.lower(), 'clean, modern, professional')
+
+    if brand_context and len(brand_context.strip()) > 20:
+        brand_info = f"Brand guidelines:\n{brand_context[:500]}"
+    elif brand_name:
+        brand_info = f"Brand: {brand_name}"
+    else:
+        brand_info = ''
+
+    prompt_text = (
+        f"Convert this social media post caption into an image generation prompt.\n\n"
+        f"Platform: {platform} ({style})\n"
+        f"Tone: {tone}\n"
+        f"{brand_info}\n\n"
+        f"Caption:\n{caption}\n\n"
+        f"Rules:\n"
+        f"- Describe a photorealistic scene that matches the brand and caption\n"
+        f"- Include brand name or product in the scene if relevant\n"
+        f"- Specify lighting, composition, and mood\n"
+        f"- Keep it under 200 words\n"
+        f"- Return ONLY the image prompt — no explanations, no preamble\n"
+    )
+
+    try:
+        response = _llm.invoke([HumanMessage(content=prompt_text)])
+        raw = response.content.strip()
+        # Strip any markdown headings or preamble Claude occasionally adds
+        lines = raw.splitlines()
+        cleaned = [l for l in lines if not l.startswith('#') and not l.lower().startswith('image generation prompt')]
+        return '\n'.join(cleaned).strip()
+    except Exception:
+        # Fallback: simple keyword prompt
+        words = caption.replace('#', '').replace('@', '').split()[:8]
+        return f"{brand_name} {' '.join(words)} {style}, photorealistic".strip()
+
+
+def generate_image(caption: str, platform: str, tone: str = 'professional',
+                   brand_name: str = '', brand_context: str = '') -> dict:
+    """
+    Generates a brand-aware image for a post using gpt-image-1.
+    Author: Khushee Paprunia
+
+    Args:
+        caption      : post text to generate image for
+        platform     : 'twitter', 'linkedin', or 'instagram'
+        tone         : post tone (used for style guidance)
+        brand_name   : brand name fallback if no RAG context
+        brand_context: RAG-retrieved brand guidelines (preferred)
+
+    Returns:
+        dict with keys:
+            image_url   : data URI (base64) or URL string, or None on failure
+            image_prompt: prompt sent to the model
+            success     : bool
+    """
+    try:
+        from openai import OpenAI as _OpenAI
+        _load_api_keys()
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if not openai_key:
+            raise EnvironmentError("OPENAI_API_KEY not found in .env")
+        client = _OpenAI(api_key=openai_key)
+
+        # Build brand-aware image prompt via Claude
+        image_prompt = _caption_to_image_prompt(
+            caption, platform, tone, brand_name, brand_context
+        )
+        print(f"  Image prompt: {image_prompt[:80]}...")
+
+        response = client.images.generate(
+            model="gpt-image-1",
+            prompt=image_prompt,
+            size="1024x1024",
+            n=1
+        )
+
+        image_data = response.data[0]
+        if hasattr(image_data, 'url') and image_data.url:
+            final_url = image_data.url
+        else:
+            b64 = image_data.b64_json
+            final_url = f"data:image/png;base64,{b64}"
+
+        print(f"  Image generated ✅")
+        return {'image_url': final_url, 'image_prompt': image_prompt, 'success': True}
+
+    except Exception as e:
+        print(f"  ⚠️ Image generation failed: {e}")
+        return {'image_url': None, 'image_prompt': None, 'success': False}
+
+
+def generate_images_for_variants(variants: list, platform: str,
+                                  top_n: int = 1, brand_name: str = '',
+                                  brand_context: str = '') -> list:
+    """
+    Generates images for the top N ranked post variants.
+    Author: Khushee Paprunia
+
+    Args:
+        variants     : ranked list of post variants from optimize_variants()
+        platform     : 'twitter', 'linkedin', or 'instagram'
+        top_n        : number of variants to generate images for (default 1)
+        brand_name   : brand name for image prompt
+        brand_context: RAG brand guidelines for image prompt
+
+    Returns:
+        variants list with image_url, image_prompt, image_success added
+    """
+    print(f"\nGenerating images for top {top_n} variant(s)...")
+    for i, variant in enumerate(variants):
+        if i < top_n:
+            caption = variant.get('post_text', '')
+            tone    = variant.get('tone', 'professional')
+            result  = generate_image(caption, platform, tone, brand_name, brand_context)
+            variant['image_url']     = result['image_url']
+            variant['image_prompt']  = result['image_prompt']
+            variant['image_success'] = result['success']
+        else:
+            variant['image_url']     = None
+            variant['image_prompt']  = None
+            variant['image_success'] = False
+    return variants

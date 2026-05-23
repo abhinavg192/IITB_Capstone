@@ -316,6 +316,107 @@ def get_feature_importance(model_version: str = 'manas') -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# DISTILBERT CONTENT QUALITY SCORING (Khushee Paprunia)
+# Model: https://huggingface.co/abhinav192/distilbert-engagement
+# Fine-tuned on 50K Twitter + LinkedIn posts, RMSE 0.0793
+# Architecture: DistilBERT + regression head (768→256→1 + Sigmoid)
+# Returns content quality score: 0.0 (low) to 1.0 (high)
+# ─────────────────────────────────────────────────────────────
+
+HF_DISTILBERT_REPO = "abhinav192/distilbert-engagement"
+
+_distilbert_tokenizer  = None
+_distilbert_model      = None
+_distilbert_regressor  = None
+
+
+def _load_distilbert():
+    """
+    Loads DistilBERT + regression head from HuggingFace.
+    Caches in memory after first load.
+    Author: Khushee Paprunia
+    """
+    global _distilbert_tokenizer, _distilbert_model, _distilbert_regressor
+
+    if _distilbert_tokenizer is not None:
+        return _distilbert_tokenizer, _distilbert_model, _distilbert_regressor
+
+    try:
+        import torch
+        import torch.nn as nn
+        from transformers import DistilBertModel, DistilBertTokenizerFast
+        from huggingface_hub import hf_hub_download
+
+        print(f"  Loading DistilBERT from HuggingFace ({HF_DISTILBERT_REPO})...")
+
+        tokenizer  = DistilBertTokenizerFast.from_pretrained(HF_DISTILBERT_REPO)
+        distilbert = DistilBertModel.from_pretrained(HF_DISTILBERT_REPO)
+
+        regressor = nn.Sequential(
+            nn.Linear(768, 256), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(256, 1),   nn.Sigmoid()
+        )
+        regressor_path = hf_hub_download(
+            repo_id=HF_DISTILBERT_REPO,
+            filename="regressor_head.pt"
+        )
+        regressor.load_state_dict(
+            torch.load(regressor_path, map_location='cpu')
+        )
+
+        _distilbert_tokenizer  = tokenizer
+        _distilbert_model      = distilbert
+        _distilbert_regressor  = regressor
+
+        print("  ✅ DistilBERT loaded successfully.")
+        return tokenizer, distilbert, regressor
+
+    except Exception as e:
+        print(f"  ⚠️ DistilBERT load failed: {e}")
+        return None, None, None
+
+
+def score_content_quality(text: str, max_len: int = 128) -> float:
+    """
+    Scores content quality of a post using fine-tuned DistilBERT.
+    Model: abhinav192/distilbert-engagement (HuggingFace)
+    Author: Khushee Paprunia
+
+    Args:
+        text    : post text to score
+        max_len : max token length (default 128 — matches training)
+
+    Returns:
+        float: content quality score 0.0–1.0
+               Returns 0.5 (neutral) if model unavailable.
+    """
+    import torch
+
+    tokenizer, distilbert, regressor = _load_distilbert()
+    if tokenizer is None:
+        return 0.5
+
+    distilbert.eval()
+    regressor.eval()
+
+    encoding = tokenizer(
+        text,
+        max_length=max_len,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    )
+    with torch.no_grad():
+        cls_output = distilbert(
+            input_ids=encoding['input_ids'],
+            attention_mask=encoding['attention_mask']
+        ).last_hidden_state[:, 0, :]
+        score = regressor(cls_output).item()
+
+    return round(score, 4)
+
+
+# ─────────────────────────────────────────────────────────────
 # QUICK TEST
 # ─────────────────────────────────────────────────────────────
 

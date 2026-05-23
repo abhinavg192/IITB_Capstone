@@ -12,7 +12,6 @@ os.environ["OMP_NUM_THREADS"] = "1"
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import json
-import math
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -24,7 +23,7 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from modules.predictor import predict_engagement
-from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features
+from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features, generate_images_for_variants, rerank_with_judge
 from modules.rag import build_index, retrieve_brand_context, is_index_built
 from modules.judge import judge_variants, judge
 
@@ -100,16 +99,11 @@ if 'generated_posts' not in st.session_state:
 if 'selected_post' not in st.session_state:
     st.session_state.selected_post = None
 
-_LOG_MAX = math.log1p(4.0)  # log-scale ceiling anchored to raw score ~4
-
-
 def _add_display_scores(variants):
-    """Map raw XGBoost scores to a 0-100 index via log-scale absolute normalization.
-    Anchored to a realistic ceiling (~4.0 raw) so scores reflect genuine quality,
-    not just relative rank within the batch."""
+    """Map normalized 0-1 hybrid scores to a 0-100 display index."""
     for v in variants:
         r = v.get('predicted_score') or 0
-        v['display_score'] = min(100, max(0, round(math.log1p(r) / _LOG_MAX * 100)))
+        v['display_score'] = min(100, max(0, round(r * 100)))
     return variants
 
 
@@ -138,8 +132,7 @@ def run_pipeline(brand, topic, platform, tone, pdf_path=None):
         platform.lower()
     )
 
-    # Add scoring_failed flag and normalized display score to each variant
-    _add_display_scores(ranked)
+    # Add scoring_failed flag to each variant
     for v in ranked:
         v['scoring_failed'] = scoring_failed
 
@@ -152,6 +145,29 @@ def run_pipeline(brand, topic, platform, tone, pdf_path=None):
         judge_variants(ranked, brand_context, judge_question)
     except Exception as e:
         print(f"⚠️ Judge step skipped: {e}")
+
+    # Re-rank using 4-way equal hybrid: XGBoost + DistilBERT + faithfulness + relevance
+    try:
+        print("\nRe-ranking with judge scores (4-way equal hybrid)...")
+        ranked = rerank_with_judge(ranked)
+    except Exception as e:
+        print(f"⚠️ Re-ranking skipped: {e}")
+
+    # Convert final predicted_score (4-way hybrid) to 0-100 display score
+    _add_display_scores(ranked)
+
+    # Generate images for all 5 variants (Khushee Paprunia)
+    try:
+        b_context = brand_context or ''
+        ranked = generate_images_for_variants(
+            ranked,
+            platform.lower(),
+            top_n=5,
+            brand_name=brand,
+            brand_context=b_context
+        )
+    except Exception as e:
+        print(f"⚠️ Image generation skipped: {e}")
 
     return ranked
 
@@ -397,6 +413,17 @@ def screen_output():
                     if explanation and explanation != "judge unavailable":
                         st.caption(f"💬 _{explanation}_")
             
+            # Generated image (Khushee Paprunia)
+            if variant.get('image_url'):
+                st.markdown("**Generated Image:**")
+                st.markdown(
+                    f'<img src="{variant["image_url"]}" style="width:100%;border-radius:8px;margin-top:8px;">',
+                    unsafe_allow_html=True
+                )
+                if variant.get('image_prompt'):
+                    with st.expander("🎨 View image prompt"):
+                        st.caption(variant['image_prompt'])
+
             # Action buttons — Edit | Regenerate | Analytics on one row, Copy below
             col_b1, col_b2, col_b3 = st.columns(3)
             with col_b1:
