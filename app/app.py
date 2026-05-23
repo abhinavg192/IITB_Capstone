@@ -22,7 +22,7 @@ import random
 import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from modules.predictor import predict_engagement
+from modules.predictor import predict_engagement, score_content_quality
 from modules.pipeline import generate_posts, optimize_variants, get_last_context, extract_features, generate_images_for_variants, rerank_with_judge
 from modules.rag import build_index, retrieve_brand_context, is_index_built
 from modules.judge import judge_variants, judge
@@ -449,7 +449,8 @@ def screen_output():
                                 new_v = new_variants[pick]
                                 feats = extract_features(new_v, posts_data['platform'].lower())
                                 new_v['features'] = feats
-                                new_v['predicted_score'] = predict_engagement(feats)
+                                new_v['xgb_score'] = predict_engagement(feats)
+                                new_v['bert_score'] = score_content_quality(new_v.get('post_text', ''))
                                 new_v['is_recommended'] = False
                                 new_v['scoring_failed'] = False
                                 brand_ctx = get_last_context()
@@ -461,7 +462,29 @@ def screen_output():
                                 new_v['judge_faithfulness'] = jr.get('faithfulness')
                                 new_v['judge_relevance'] = jr.get('relevance')
                                 new_v['judge_explanation'] = jr.get('explanation', '')
+                                try:
+                                    generate_images_for_variants(
+                                        [new_v],
+                                        posts_data['platform'].lower(),
+                                        top_n=1,
+                                        brand_name=posts_data['brand'],
+                                        brand_context=brand_ctx or '',
+                                    )
+                                except Exception as img_e:
+                                    print(f"⚠️ Image regeneration skipped: {img_e}")
+                                    new_v['image_url'] = None
+                                    new_v['image_prompt'] = None
                                 posts_data['variants'][idx - 1] = new_v
+                                try:
+                                    posts_data['variants'] = rerank_with_judge(posts_data['variants'])
+                                except Exception as rerank_e:
+                                    print(f"⚠️ Re-ranking skipped after regenerate: {rerank_e}")
+                                    new_v['predicted_score'] = round(
+                                        0.25 * new_v['bert_score'] +
+                                        0.25 * ((new_v.get('judge_faithfulness') or 5) / 10.0) +
+                                        0.25 * ((new_v.get('judge_relevance') or 5) / 10.0),
+                                        4
+                                    )
                                 _add_display_scores(posts_data['variants'])
                                 st.session_state.generated_posts = posts_data
                                 st.rerun()
