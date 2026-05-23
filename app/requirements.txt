@@ -12,4 +12,5 @@ sentence-transformers
 torchvision
 langchain-community
 pypdf
+openai
 
